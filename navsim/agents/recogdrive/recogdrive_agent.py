@@ -42,6 +42,8 @@ class ReCogDriveAgent(AbstractAgent):
         reference_policy_checkpoint: Optional[str] = '', 
         vlm_size: Optional[str] = 'small', 
         train_backbone: bool = False,
+        vlm_prune_keep_ratio: float = 1.0,
+        vlm_prune_method: str = 'tfps',
     ):
         super().__init__()
         self._trajectory_sampling = trajectory_sampling
@@ -58,6 +60,8 @@ class ReCogDriveAgent(AbstractAgent):
         self.reference_policy_checkpoint = reference_policy_checkpoint
         self.vlm_size = vlm_size
         self.train_backbone = train_backbone
+        self.vlm_prune_keep_ratio = vlm_prune_keep_ratio
+        self.vlm_prune_method = vlm_prune_method
 
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
         device = f"cuda:{local_rank}"
@@ -69,7 +73,9 @@ class ReCogDriveAgent(AbstractAgent):
             self.backbone = RecogDriveBackbone(
                 model_type=self.vlm_type,
                 checkpoint_path=self.vlm_path,
-                device=device
+                device=device,
+                prune_keep_ratio=self.vlm_prune_keep_ratio,
+                prune_method=self.vlm_prune_method,
             )
 
             if not self.train_backbone:

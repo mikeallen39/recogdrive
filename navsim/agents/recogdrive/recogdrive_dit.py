@@ -3,6 +3,8 @@
 # Copyright (c) Xiaomi Corporation. All rights reserved.
 # ------------------------------------------------------------------------
 
+from __future__ import annotations
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -256,6 +258,3 @@ class LightningDiT(nn.Module):
         output = self.final_layer(hidden_states, conditioning)
         
         return (output, all_hidden_states) if return_hidden_states else output
-
-
-
