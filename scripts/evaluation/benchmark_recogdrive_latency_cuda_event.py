@@ -11,7 +11,14 @@ from hydra.utils import instantiate
 from transformers.feature_extraction_utils import BatchFeature
 
 from navsim.agents.recogdrive.recogdrive_agent import ReCogDriveAgent
+from navsim.agents.recogdrive.recogdrive_backbone import (
+    IMG_CONTEXT_TOKEN,
+    IMG_END_TOKEN,
+    IMG_START_TOKEN,
+    system_message,
+)
 from navsim.agents.recogdrive.recogdrive_features import format_number
+from navsim.agents.recogdrive.utils.conversation import get_conv_template
 from navsim.agents.recogdrive.utils.internvl_preprocess import load_image
 from navsim.common.dataloader import SceneLoader
 
@@ -86,6 +93,107 @@ def make_agent_input_features(agent, agent_input):
     return {key: value.unsqueeze(0) for key, value in features.items()}
 
 
+def build_profiled_backbone_inputs(backbone, pixel_values, questions, num_patches_list):
+    queries = []
+    for idx, num_patches in enumerate(num_patches_list):
+        question = questions[idx]
+        if pixel_values is not None and "<image>" not in question:
+            question = "<image>\n" + question
+
+        template = get_conv_template("internvl2_5")
+        template.system_message = system_message
+        template.append_message(template.roles[0], question)
+        template.append_message(template.roles[1], None)
+        query = template.get_prompt()
+
+        image_tokens = (
+            IMG_START_TOKEN
+            + IMG_CONTEXT_TOKEN * backbone.pruned_num_image_token * num_patches
+            + IMG_END_TOKEN
+        )
+        queries.append(query.replace("<image>", image_tokens, 1))
+
+    backbone.tokenizer.padding_side = "left"
+    if backbone.prune_keep_ratio < 1.0:
+        model_inputs = backbone.tokenizer(queries, return_tensors="pt", padding=True)
+    else:
+        model_inputs = backbone.tokenizer(
+            queries, return_tensors="pt", padding="max_length", max_length=2800
+        )
+
+    device = pixel_values.device if pixel_values.is_cuda else torch.device("cuda")
+    input_ids = model_inputs["input_ids"].to(device)
+    attention_mask = model_inputs["attention_mask"].to(device)
+    backbone.last_input_seq_len = int(input_ids.shape[1])
+
+    position_ids = attention_mask.long().cumsum(-1) - 1
+    position_ids.masked_fill_(attention_mask == 0, 1)
+    image_flags = torch.ones(pixel_values.size(0), dtype=torch.bool, device=device)
+
+    return input_ids, attention_mask, position_ids, image_flags
+
+
+def run_profiled_backbone(backbone, pixel_values, questions, num_patches_list):
+    tokenize_wall_ms, model_inputs = wall_time_ms(
+        lambda: build_profiled_backbone_inputs(backbone, pixel_values, questions, num_patches_list)
+    )
+    input_ids, attention_mask, position_ids, image_flags = model_inputs
+    model_dtype = next(backbone.model.parameters()).dtype
+
+    def run_vision_encoder():
+        vit_embeds = backbone.model.extract_feature(pixel_values.to(model_dtype))
+        return vit_embeds[image_flags]
+
+    vision_encoder_ms, vit_embeds = cuda_time_ms(run_vision_encoder)
+
+    if backbone.prune_keep_ratio < 1.0:
+        token_select_ms, vit_embeds = cuda_time_ms(lambda: backbone._select_visual_tokens(vit_embeds))
+    else:
+        token_select_ms = 0.0
+
+    def build_input_embeds():
+        input_embeds = backbone.model.language_model.get_input_embeddings()(input_ids).clone()
+        batch_size, seq_len, hidden_dim = input_embeds.shape
+        flat_input_embeds = input_embeds.reshape(batch_size * seq_len, hidden_dim)
+        flat_input_ids = input_ids.reshape(batch_size * seq_len)
+        selected = flat_input_ids == backbone.img_context_token_id
+        flat_vit_embeds = vit_embeds.reshape(-1, hidden_dim)
+
+        num_selected = int(selected.sum().item())
+        if num_selected != flat_vit_embeds.shape[0]:
+            raise RuntimeError(
+                f"IMG_CONTEXT token count ({num_selected}) does not match visual token count "
+                f"({flat_vit_embeds.shape[0]})."
+            )
+
+        flat_input_embeds[selected] = flat_vit_embeds.to(flat_input_embeds.device)
+        return flat_input_embeds.reshape(batch_size, seq_len, hidden_dim)
+
+    embed_replace_ms, input_embeds = cuda_time_ms(build_input_embeds)
+
+    language_model_ms, outputs = cuda_time_ms(
+        lambda: backbone.model.language_model(
+            inputs_embeds=input_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+    )
+
+    profile = {
+        "vlm_tokenize_wall_ms": tokenize_wall_ms,
+        "vision_encoder_cuda_ms": vision_encoder_ms,
+        "token_select_cuda_ms": token_select_ms,
+        "embed_replace_cuda_ms": embed_replace_ms,
+        "language_model_cuda_ms": language_model_ms,
+        "vlm_profile_cuda_ms": (
+            vision_encoder_ms + token_select_ms + embed_replace_ms + language_model_ms
+        ),
+    }
+    return profile, outputs
+
+
 def run_one(agent, agent_input):
     feature_wall_ms, features = wall_time_ms(lambda: make_agent_input_features(agent, agent_input))
 
@@ -103,6 +211,9 @@ def run_one(agent, agent_input):
 
     vlm_ms, outputs = cuda_time_ms(
         lambda: agent.backbone(pixel_values_cat, questions, num_patches_list=num_patches_list)
+    )
+    backbone_profile, _ = run_profiled_backbone(
+        agent.backbone, pixel_values_cat, questions, num_patches_list
     )
     last_hidden_state = outputs.hidden_states[-1]
 
@@ -140,6 +251,7 @@ def run_one(agent, agent_input):
         "image_preprocess_wall_ms": image_wall_ms,
         "image_h2d_cuda_ms": h2d_ms,
         "vlm_cuda_ms": vlm_ms,
+        **backbone_profile,
         "diffusion_cuda_ms": diffusion_ms,
         "e2e_gpu_cuda_ms": e2e_gpu_ms,
         "postprocess_wall_ms": post_wall_ms,
@@ -218,6 +330,9 @@ def main():
                         "warmup": record["warmup"],
                         "e2e_gpu_cuda_ms": record["e2e_gpu_cuda_ms"],
                         "vlm_cuda_ms": record["vlm_cuda_ms"],
+                        "vision_encoder_cuda_ms": record["vision_encoder_cuda_ms"],
+                        "token_select_cuda_ms": record["token_select_cuda_ms"],
+                        "language_model_cuda_ms": record["language_model_cuda_ms"],
                         "diffusion_cuda_ms": record["diffusion_cuda_ms"],
                         "num_patches": record["num_patches"],
                         "num_visual_tokens": record["num_visual_tokens"],
@@ -234,6 +349,12 @@ def main():
         "image_preprocess_wall_ms",
         "image_h2d_cuda_ms",
         "vlm_cuda_ms",
+        "vlm_tokenize_wall_ms",
+        "vision_encoder_cuda_ms",
+        "token_select_cuda_ms",
+        "embed_replace_cuda_ms",
+        "language_model_cuda_ms",
+        "vlm_profile_cuda_ms",
         "diffusion_cuda_ms",
         "e2e_gpu_cuda_ms",
         "postprocess_wall_ms",

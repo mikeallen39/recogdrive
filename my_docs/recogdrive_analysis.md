@@ -14,14 +14,15 @@
 
 ## 结果文件
 
-- 2B-RL，未安装 FlashAttention2：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_cuda_event_50.json`
-- 8B-RL，未安装 FlashAttention2：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_8b_cuda_event_50.json`
 - 2B-RL，FlashAttention2：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_cuda_event_50_fa2.json`
 - 8B-RL，FlashAttention2：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_8b_cuda_event_50_fa2.json`
 - 2B-RL，FA2 + uniform token pruning 10%：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_prune_uniform_0.10_50.json`
 - 2B-RL，FA2 + T-FPS token pruning 10%：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_prune_tfps_0.10_50.json`
 - 2B-RL，FA2 + T-FPS token pruning 25%：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_prune_tfps_0.25_50.json`
 - 2B-RL，FA2 + T-FPS token pruning 50%：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_prune_tfps_0.50_50.json`
+- 2B-RL，FA2 + VLM 拆分 profiling baseline：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_profile_baseline_50.json`
+- 2B-RL，FA2 + VLM 拆分 profiling T-FPS 25%：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_profile_tfps_0.25_50.json`
+- 2B-RL，FA2 + VLM 拆分 profiling T-FPS 50%：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_profile_tfps_0.50_50.json`
 
 FlashAttention2 复测环境：
 
@@ -54,50 +55,15 @@ FlashAttention2 复测环境：
 - `image_preprocess_wall_ms`：PIL 读图、dynamic preprocess、resize、normalize、stack 的 CPU 时间。
 - `image_h2d_cuda_ms`：图像 tensor 拼接并搬到 GPU 的 CUDA event 时间。
 - `vlm_cuda_ms`：InternVL backbone 前向的 CUDA event 时间。
+- `vision_encoder_cuda_ms`：InternVL vision encoder / `extract_feature()` 的 CUDA event 时间。
+- `token_select_cuda_ms`：视觉 token selection 的 CUDA event 时间。baseline 没有 pruning，因此为 `0`。
+- `language_model_cuda_ms`：InternVL language model forward 的 CUDA event 时间。
 - `diffusion_cuda_ms`：diffusion planner/action head 的 CUDA event 时间。
 - `e2e_gpu_cuda_ms`：从图像 tensor H2D、VLM forward 到 diffusion planner 的 GPU 端到端 CUDA event 时间。
 
 注意：`e2e_gpu_cuda_ms` 不包含 CPU 图片预处理时间；真实在线系统如果没有异步预处理，需要额外考虑 `image_preprocess_wall_ms`。
 
-## 2B-RL 对比
-
-| 模块 | no FA2 mean(ms) | FA2 mean(ms) | 加速比 | 下降比例 |
-|---|---:|---:|---:|---:|
-| VLM forward | 309.242 | 144.699 | 2.14x | 53.2% |
-| diffusion planner | 87.902 | 88.864 | 0.99x | -1.1% |
-| GPU 端到端 | 401.785 | 237.682 | 1.69x | 40.8% |
-| 图片预处理 CPU | 92.264 | 92.291 | 1.00x | 0.0% |
-
-2B-RL 安装 FA2 后，VLM forward 从 `309.2 ms` 降到 `144.7 ms`，GPU 端到端从 `401.8 ms` 降到 `237.7 ms`。diffusion planner 基本不受影响，仍在 `~89 ms`。
-
-如果把 CPU 图片预处理也粗略计入，同步端到端延迟从：
-
-`92.264 + 401.785 = 494.049 ms`
-
-下降到：
-
-`92.291 + 237.682 = 329.973 ms`
-
-## 8B-RL 对比
-
-| 模块 | no FA2 mean(ms) | FA2 mean(ms) | 加速比 | 下降比例 |
-|---|---:|---:|---:|---:|
-| VLM forward | 574.404 | 301.837 | 1.90x | 47.5% |
-| diffusion planner | 91.321 | 89.810 | 1.02x | 1.7% |
-| GPU 端到端 | 669.686 | 395.597 | 1.69x | 40.9% |
-| 图片预处理 CPU | 75.548 | 75.323 | 1.00x | 0.3% |
-
-8B-RL 安装 FA2 后，VLM forward 从 `574.4 ms` 降到 `301.8 ms`，GPU 端到端从 `669.7 ms` 降到 `395.6 ms`。8B 的主要瓶颈仍然是 VLM forward。
-
-如果把 CPU 图片预处理也粗略计入，同步端到端延迟从：
-
-`75.548 + 669.686 = 745.234 ms`
-
-下降到：
-
-`75.323 + 395.597 = 470.920 ms`
-
-## FA2 后的 2B vs 8B
+## FA2 下的 2B vs 8B
 
 | 指标 | 2B-RL FA2 mean(ms) | 8B-RL FA2 mean(ms) | 8B / 2B |
 |---|---:|---:|---:|
@@ -108,10 +74,9 @@ FlashAttention2 复测环境：
 
 核心结论：
 
-- FlashAttention2 对 ReCogDrive 的推理加速非常明显，主要收益全部来自 VLM backbone。
-- 2B/8B 的 GPU 端到端延迟都下降约 `41%`，但 diffusion planner 仍然约 `90 ms`，几乎没有变化。
-- 安装 FA2 后，2B 的 VLM 和 diffusion 延迟已经接近同一量级；如果继续优化 2B，只优化 VLM 的边际收益会下降，需要同时考虑 diffusion steps 或 action head 蒸馏。
-- 8B 的瓶颈仍然是 VLM forward，FA2 后 VLM 仍占 GPU 端到端的约 `76%`。
+- 本文档只保留 FA2 环境下的 latency 结果，因为 ReCogDrive 推理复现和后续优化均默认必须使用 FA2。
+- FA2 下，2B 的 VLM 和 diffusion 延迟已经接近同一量级；如果继续优化 2B，只优化 VLM 的边际收益会下降，需要同时考虑 diffusion steps 或 action head 蒸馏。
+- FA2 下，8B 的瓶颈仍然是 VLM forward，VLM 占 GPU 端到端的约 `76%`。
 - CPU 图片预处理不受 FA2 影响，仍然有 `75-92 ms` 的额外开销；在线部署时需要异步预处理或预取，否则会显著拉高端到端 latency。
 
 ## 2B-RL + 视觉 Token Pruning
@@ -148,6 +113,24 @@ FlashAttention2 复测环境：
 - `T-FPS@0.50` 虽然减少了语言模型输入视觉 token，但当前实现要先跑完整 `extract_feature()`，再做 T-FPS 选择，并走手写 InternVL forward；50% 保留率下 token selection 和手写路径开销已经抵消了 token 数下降带来的收益。
 - `T-FPS@0.25` 有小幅 latency 收益，但收益有限，因为 diffusion planner 仍然稳定占 `~89 ms`。
 - 继续优化 T-FPS 应优先降低 selection 开销，或者改成低成本 token selection；否则较高 keep ratio 很难获得实际端到端加速。
+
+### VLM 拆分 Profiling
+
+为定位 `T-FPS@0.50` 反而变慢的原因，对 2B-RL 的 VLM forward 进一步拆分为 `vision encoder / token selection / language model`。该 profiling 会在原始 `vlm_cuda_ms` 之外额外跑一次手动拆分 forward，因此应看各子项的相对大小；`vlm_cuda_ms` 仍是原始完整 VLM forward 的端到端 CUDA event 计时。
+
+| 配置 | visual tokens | seq len | VLM mean(ms) | vision encoder(ms) | token select(ms) | LLM(ms) | diffusion(ms) | e2e GPU(ms) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2B + FA2 baseline | 2304 | 2800.0 | 145.148 | 43.683 | 0.000 | 80.057 | 88.699 | 238.903 |
+| 2B + FA2 + T-FPS 25% | 576 | 1060.2 | 125.208 | 43.170 | 41.337 | 31.926 | 88.798 | 217.965 |
+| 2B + FA2 + T-FPS 50% | 1152 | 1636.2 | 178.636 | 43.547 | 78.411 | 44.255 | 89.164 | 272.188 |
+
+拆分结论：
+
+- Vision encoder 延迟基本不随 keep ratio 变化，三组都在 `~43.5 ms`，说明当前 pruning 没有减少视觉编码器计算。
+- T-FPS@25% 将 LLM 从 `80.1 ms` 降到 `31.9 ms`，节省约 `48.1 ms`，但新增 token selection `41.3 ms`，所以 VLM 只净减少约 `20 ms`。
+- T-FPS@50% 将 LLM 从 `80.1 ms` 降到 `44.3 ms`，节省约 `35.8 ms`，但 token selection 增加到 `78.4 ms`，净结果是 VLM 比 baseline 慢约 `33.5 ms`。
+- 因此 `0.50` keep ratio 变慢的直接原因是 T-FPS selection 成本过高；它的计算开销超过了减少 LLM token 后得到的收益。
+- 如果继续沿这个方向优化，优先考虑低成本 selection，例如 uniform、score/top-k、分块近似 FPS，或者在 vision encoder 内部提前 prune，而不是 `extract_feature()` 之后做全量 T-FPS。
 
 ## 2B-RL + T-FPS Navtest 精度
 
