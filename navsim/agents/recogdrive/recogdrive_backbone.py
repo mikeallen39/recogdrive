@@ -132,6 +132,11 @@ class RecogDriveBackbone(nn.Module):
             return vit_embeds
 
         keep_tokens = self._get_pruned_num_image_token(vit_embeds.shape[1])
+        if self.prune_method in {"uniform_merge", "merge_uniform", "uniform-merge"}:
+            return F.adaptive_avg_pool1d(
+                vit_embeds.transpose(1, 2).contiguous(),
+                keep_tokens,
+            ).transpose(1, 2).contiguous()
         if self.prune_method in {"uniform", "stride"}:
             indices = torch.linspace(
                 0,

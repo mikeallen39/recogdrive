@@ -20,5 +20,6 @@ vlm_size: 'small'
 train_backbone: false
 vlm_prune_keep_ratio: 1.0
 vlm_prune_method: 'tfps'
+diffusion_num_inference_steps: 5
 grpo: False
 lr: 1e-4

@@ -30,6 +30,30 @@ FlashAttention2 复测环境：
 - `flash-attn=2.7.4.post1`
 - wheel：`flash_attn-2.7.4.post1+cu12torch2.5cxx11abiFALSE-cp39-cp39-linux_x86_64.whl`
 
+## 总表
+
+端到端 latency 采用同步单次请求口径：
+
+`feature_wall_ms + image_preprocess_wall_ms + e2e_gpu_cuda_ms + postprocess_wall_ms`
+
+`未测` 表示该配置已有 navtest PDMS，但尚未跑对应的 CUDA-event latency benchmark。
+
+| 配置 | PDMS | 端到端 latency(ms) |
+|---|---:|---:|
+| 2B baseline, DDIM 5 | 0.904283 | 330.210 |
+| 8B baseline, DDIM 5 | 0.903133 | 471.152 |
+| 2B DDIM 3 | 0.907049 | 277.699 |
+| 2B DDIM 2 | 0.883279 | 261.931 |
+| 2B DDIM 1 | 0.013528 | 245.402 |
+| 2B uniform pruning 0.10 | 0.671761 | 250.702 |
+| 2B uniform pruning 0.25 | 0.781920 | 260.373 |
+| 2B uniform pruning 0.50 | 0.881033 | 272.212 |
+| 2B T-FPS pruning 0.10 | 0.691985 | 265.084 |
+| 2B T-FPS pruning 0.25 | 0.801383 | 295.150 |
+| 2B T-FPS pruning 0.50 | 0.866982 | 352.433 |
+| 2B uniform merging 0.25 | 0.737774 | 252.952 |
+| 2B uniform merging 0.50 | 0.872196 | 270.941 |
+
 ## 原始模型 Navtest 精度
 
 测试设置：
@@ -62,6 +86,30 @@ FlashAttention2 复测环境：
 - `e2e_gpu_cuda_ms`：从图像 tensor H2D、VLM forward 到 diffusion planner 的 GPU 端到端 CUDA event 时间。
 
 注意：`e2e_gpu_cuda_ms` 不包含 CPU 图片预处理时间；真实在线系统如果没有异步预处理，需要额外考虑 `image_preprocess_wall_ms`。
+
+## 单次请求完整 Latency
+
+这里的“单次请求完整 latency”按同步在线推理口径估算：
+
+`feature_wall_ms + image_preprocess_wall_ms + e2e_gpu_cuda_ms + postprocess_wall_ms`
+
+该口径包含特征构造、CPU 图片预处理、图像 H2D、VLM forward、diffusion planner 和预测轨迹回 CPU；不包含数据集 dataloader 查 token、日志读取、评测打分、进程间调度等 navtest 框架开销。如果线上把 CPU 图片预处理和 GPU 推理做流水并行，实际端到端关键路径会低于该同步估算。
+
+| 配置 | feature(ms) | 图片预处理 CPU(ms) | e2e GPU(ms) | postprocess(ms) | 单次请求完整 latency(ms) |
+|---|---:|---:|---:|---:|---:|
+| 2B + FA2 baseline | 0.198 | 92.291 | 237.682 | 0.039 | 330.210 |
+| 8B + FA2 baseline | 0.192 | 75.323 | 395.597 | 0.040 | 471.152 |
+| 2B + FA2 + uniform 10% | 0.202 | 80.513 | 169.948 | 0.039 | 250.702 |
+| 2B + FA2 + T-FPS 10% | 0.202 | 78.126 | 186.716 | 0.040 | 265.084 |
+| 2B + FA2 + T-FPS 25% | 0.200 | 78.820 | 216.092 | 0.039 | 295.150 |
+| 2B + FA2 + T-FPS 50% | 0.193 | 75.753 | 276.448 | 0.040 | 352.433 |
+
+结论：
+
+- 2B + FA2 baseline 的同步完整请求 latency 约 `330 ms`，其中 CPU 图片预处理约占 `92 ms`，不可忽略。
+- 8B + FA2 baseline 的同步完整请求 latency 约 `471 ms`，主要增加来自 VLM forward。
+- `T-FPS@0.50` 在 GPU 端已经慢于 baseline，同步完整 latency 也更高，约 `352 ms`。
+- 如果目标是实际在线端到端延迟，除了 VLM token pruning，还需要优化或异步化 CPU 图片预处理。
 
 ## FA2 下的 2B vs 8B
 
@@ -132,32 +180,62 @@ FlashAttention2 复测环境：
 - 因此 `0.50` keep ratio 变慢的直接原因是 T-FPS selection 成本过高；它的计算开销超过了减少 LLM token 后得到的收益。
 - 如果继续沿这个方向优化，优先考虑低成本 selection，例如 uniform、score/top-k、分块近似 FPS，或者在 vision encoder 内部提前 prune，而不是 `extract_feature()` 之后做全量 T-FPS。
 
-## 2B-RL + T-FPS Navtest 精度
+## 2B-RL + Diffusion Steps Navtest 精度
+
+测试设置：
+
+- 数据集：NAVSIM navtest，完整 `12146` 个 scenario。
+- 模型：2B-RL，FlashAttention2，单前视图，无视觉 token pruning。
+- Diffusion：`sampling_method=ddim`，只改变 `agent.diffusion_num_inference_steps`。
+- 运行结果：三组均 `12146/12146` 成功，`0` failed。
+
+结果文件：
+
+- DDIM 5 steps：`/data/zxz/HUAWEI/VLA/navsim_data/exp/recogdrive_agent_eval_2b_rl_zxz/2026.05.17.09.51.16/2026.05.17.12.20.57.csv`
+- DDIM 3 steps：`/data/zxz/HUAWEI/VLA/navsim_data/exp/recogdrive_agent_eval_2b_rl_ddim3_zxz/2026.05.20.08.38.19/2026.05.20.10.19.46.csv`
+- DDIM 1 step：`/data/zxz/HUAWEI/VLA/navsim_data/exp/recogdrive_agent_eval_2b_rl_ddim1_zxz/2026.05.20.12.17.52/2026.05.20.14.12.52.csv`
+
+| 配置 | DDIM steps | PDMS | 相对 5 steps | NC | DAC | EP | TTC | C | DDC |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2B baseline | 5 | 0.904283 | - | 0.981023 | 0.976288 | 0.858269 | 0.950601 | 1.000000 | 0.966615 |
+| 2B original | 3 | 0.907049 | +0.002766 | 0.981599 | 0.977770 | 0.861740 | 0.951507 | 1.000000 | 0.967191 |
+| 2B original | 1 | 0.013528 | -0.890755 | 0.434711 | 0.114112 | 0.017215 | 0.165981 | 0.000000 | 0.170426 |
+
+结论：
+
+- `DDIM 3 steps` 相比默认 `5 steps` 没有精度下降，PDMS 反而高 `0.0028`；这个差异很小，但说明 2B 原始模型可以优先考虑把 diffusion steps 从 5 降到 3。
+- `DDIM 1 step` 直接崩溃，PDMS 只有 `0.0135`，主要问题是 `comfort=0`，同时 `ego_progress`、`DAC`、`TTC`、`DDC` 都大幅下降。
+- 因此 diffusion 采样步数的可用加速点目前是 `3 steps`，不是 `1 step`。
+
+## 2B-RL + 视觉 Token Pruning Navtest 精度
 
 测试设置：
 
 - 数据集：NAVSIM navtest，完整 `12146` 个 scenario。
 - 模型：2B-RL，FlashAttention2，单前视图。
-- Pruning：T-FPS，每个动态 image patch 从 256 个视觉 token 中按比例保留。
+- Pruning：uniform / T-FPS，每个动态 image patch 从 256 个视觉 token 中按比例保留。
 - 运行结果：所有配置均 `12146/12146` 成功，`0` failed。
 
 结果文件：
 
+- uniform 10%：`/data/zxz/HUAWEI/VLA/navsim_data/exp/recogdrive_agent_eval_2b_prune_uniform_010_zxz/2026.05.18.01.39.14/2026.05.18.03.07.49.csv`
 - T-FPS 10%：`/data/zxz/HUAWEI/VLA/navsim_data/exp/recogdrive_agent_eval_2b_prune_tfps_010_zxz/2026.05.18.01.37.42/2026.05.18.03.07.51.csv`
 - T-FPS 25%：`/data/zxz/HUAWEI/VLA/navsim_data/exp/recogdrive_agent_eval_2b_prune_tfps_025_zxz/2026.05.18.03.14.53/2026.05.18.04.42.01.csv`
 - T-FPS 50%：`/data/zxz/HUAWEI/VLA/navsim_data/exp/recogdrive_agent_eval_2b_prune_tfps_050_zxz/2026.05.18.03.14.53/2026.05.18.04.53.43.csv`
 - 2B baseline：`/data/zxz/HUAWEI/VLA/navsim_data/exp/recogdrive_agent_eval_2b_rl_zxz/2026.05.17.09.51.16/2026.05.17.12.20.57.csv`
 
-| 配置 | keep ratio | PDMS | 相对 baseline 下降 | NC | DAC | EP | TTC | C | DDC |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2B baseline | 1.00 | 0.904283 | - | 0.981023 | 0.976288 | 0.858269 | 0.950601 | 1.000000 | 0.966615 |
-| T-FPS | 0.10 | 0.691985 | 0.212298 | 0.902437 | 0.830726 | 0.669353 | 0.825539 | 1.000000 | 0.937222 |
-| T-FPS | 0.25 | 0.801383 | 0.102900 | 0.951383 | 0.900049 | 0.770379 | 0.894451 | 1.000000 | 0.956652 |
-| T-FPS | 0.50 | 0.866982 | 0.037301 | 0.971637 | 0.947308 | 0.828356 | 0.930677 | 1.000000 | 0.963568 |
+| 配置 | 方法 | keep ratio | PDMS | 相对 baseline 下降 | NC | DAC | EP | TTC | C | DDC |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2B baseline | - | 1.00 | 0.904283 | - | 0.981023 | 0.976288 | 0.858269 | 0.950601 | 1.000000 | 0.966615 |
+| Pruning | uniform | 0.10 | 0.671761 | 0.232522 | 0.858266 | 0.859625 | 0.660798 | 0.769142 | 1.000000 | 0.942244 |
+| Pruning | T-FPS | 0.10 | 0.691985 | 0.212298 | 0.902437 | 0.830726 | 0.669353 | 0.825539 | 1.000000 | 0.937222 |
+| Pruning | T-FPS | 0.25 | 0.801383 | 0.102900 | 0.951383 | 0.900049 | 0.770379 | 0.894451 | 1.000000 | 0.956652 |
+| Pruning | T-FPS | 0.50 | 0.866982 | 0.037301 | 0.971637 | 0.947308 | 0.828356 | 0.930677 | 1.000000 | 0.963568 |
 
 结论：
 
-- `T-FPS@0.10` 精度损失过大，不适合作为默认加速配置。
+- `uniform@0.10` 和 `T-FPS@0.10` 精度损失都过大，不适合作为默认加速配置。
+- 同样 10% token budget 下，`T-FPS@0.10` 的 PDMS 比 `uniform@0.10` 高 `0.0202`，说明 diversity selection 对精度有帮助，但当前 T-FPS 的 latency 开销较高。
 - `T-FPS@0.25` 相比 10% 明显恢复精度，但 PDMS 仍下降约 `0.103`，主要损失来自 DAC、EP 和 TTC。
 - `T-FPS@0.50` 是当前更合理的 Pareto 点，PDMS 下降约 `0.037`，关键安全指标也更接近 baseline。
 - 结合 latency 后，`T-FPS@0.50` 不是有效加速点；它精度好但比 baseline 更慢。`T-FPS@0.25` 有约 `9.1%` GPU 端到端加速，但 PDMS 下降约 `0.103`，速度-精度交换偏差。

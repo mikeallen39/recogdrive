@@ -270,6 +270,7 @@ def main():
     parser.add_argument("--output", type=str, default="")
     parser.add_argument("--prune-keep-ratio", type=float, default=1.0)
     parser.add_argument("--prune-method", type=str, default="tfps")
+    parser.add_argument("--diffusion-steps", type=int, default=5)
     args = parser.parse_args()
 
     if args.model_size == "2b":
@@ -299,6 +300,7 @@ def main():
                 "agent.grpo=False",
                 f"agent.vlm_prune_keep_ratio={args.prune_keep_ratio}",
                 f"agent.vlm_prune_method={args.prune_method}",
+                f"agent.diffusion_num_inference_steps={args.diffusion_steps}",
             ],
         )
 

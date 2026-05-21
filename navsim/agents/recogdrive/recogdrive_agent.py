@@ -44,6 +44,7 @@ class ReCogDriveAgent(AbstractAgent):
         train_backbone: bool = False,
         vlm_prune_keep_ratio: float = 1.0,
         vlm_prune_method: str = 'tfps',
+        diffusion_num_inference_steps: int = 5,
     ):
         super().__init__()
         self._trajectory_sampling = trajectory_sampling
@@ -62,6 +63,7 @@ class ReCogDriveAgent(AbstractAgent):
         self.train_backbone = train_backbone
         self.vlm_prune_keep_ratio = vlm_prune_keep_ratio
         self.vlm_prune_method = vlm_prune_method
+        self.diffusion_num_inference_steps = diffusion_num_inference_steps
 
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
         device = f"cuda:{local_rank}"
@@ -86,9 +88,25 @@ class ReCogDriveAgent(AbstractAgent):
                     p.requires_grad = True
 
         if self.dit_type == "large":
-            cfg = make_recogdrive_config(self.dit_type, action_dim=3, action_horizon=8, grpo=self.grpo, input_embedding_dim=1536,sampling_method=sampling_method)
+            cfg = make_recogdrive_config(
+                self.dit_type,
+                action_dim=3,
+                action_horizon=8,
+                grpo=self.grpo,
+                input_embedding_dim=1536,
+                sampling_method=sampling_method,
+                num_inference_steps=self.diffusion_num_inference_steps,
+            )
         elif self.dit_type == "small":
-            cfg = make_recogdrive_config(self.dit_type, action_dim=3, action_horizon=8, grpo=self.grpo, input_embedding_dim=384,sampling_method=sampling_method)
+            cfg = make_recogdrive_config(
+                self.dit_type,
+                action_dim=3,
+                action_horizon=8,
+                grpo=self.grpo,
+                input_embedding_dim=384,
+                sampling_method=sampling_method,
+                num_inference_steps=self.diffusion_num_inference_steps,
+            )
 
         cfg.vlm_size = self.vlm_size
 
