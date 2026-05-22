@@ -638,6 +638,145 @@ class ReCogDriveDiffusionPlanner(nn.Module):
 
         return BatchFeature(data={"pred_traj": final_actions})
 
+    def _p_mean_variance_fast_ddim(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        index: torch.Tensor,
+        vl_features: torch.Tensor,
+        vl_features_mean: torch.Tensor,
+        his_traj_features: torch.Tensor,
+        ego_status_features: torch.Tensor,
+        action_pos_embedding: Optional[torch.Tensor],
+        eta_tensor: Optional[torch.Tensor],
+        cross_attn_kv_cache: Optional[dict[int, tuple[torch.Tensor, torch.Tensor]]],
+        deterministic: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """DDIM-only inference path with loop-invariant tensors precomputed."""
+        model_dtype = next(self.model.parameters()).dtype
+        x = x.to(model_dtype)
+        action_features = self.action_encoder(x, t)
+        if action_pos_embedding is not None:
+            action_features = action_features + action_pos_embedding
+
+        fused_input = self.fusion_projector(
+            torch.cat((his_traj_features, vl_features_mean, action_features), dim=2)
+        )
+
+        if cross_attn_kv_cache is None:
+            model_output = self.model(
+                hidden_states=fused_input,
+                encoder_hidden_states=vl_features,
+                conditioning_features=ego_status_features,
+                timesteps=t
+            )
+        else:
+            model_output = self.model.forward_with_kv_cache(
+                hidden_states=fused_input,
+                encoder_hidden_states=vl_features,
+                conditioning_features=ego_status_features,
+                timesteps=t,
+                kv_cache=cross_attn_kv_cache,
+            )
+        pred_noise = self.action_decoder(model_output)
+
+        alpha_t = self.extract(self.ddim_alphas, index, x.shape)
+        sqrt_one_minus_alpha_t = self.extract(self.ddim_sqrt_one_minus_alphas, index, x.shape)
+        x_recon = (x - sqrt_one_minus_alpha_t * pred_noise) / (alpha_t**0.5)
+
+        denoised_clip_value = getattr(self, 'denoised_clip_value', 1.0)
+        x_recon.clamp_(-denoised_clip_value, denoised_clip_value)
+
+        alpha_prev = self.extract(self.ddim_alphas_prev, index, x.shape)
+        pred_noise = (x - (alpha_t**0.5) * x_recon) / sqrt_one_minus_alpha_t
+
+        eps_clip_value = getattr(self, 'eps_clip_value', None)
+        if eps_clip_value is not None:
+            pred_noise.clamp_(-eps_clip_value, eps_clip_value)
+
+        etas = torch.zeros((x.shape[0], 1, 1), device=x.device) if deterministic else eta_tensor
+        sigma = (
+            etas
+            * ((1 - alpha_prev) / (1 - alpha_t) * (1 - alpha_t / alpha_prev)) ** 0.5
+        ).clamp_(min=1e-10)
+
+        pred_dir_xt = (1.0 - alpha_prev - sigma**2).clamp(min=0).sqrt() * pred_noise
+        model_mean = (alpha_prev**0.5) * x_recon + pred_dir_xt
+        model_log_variance = torch.log(sigma**2 + 1e-20)
+
+        return model_mean, model_log_variance, x_recon
+
+    def get_action_fast_ddim(
+        self,
+        vl_features: torch.Tensor,
+        action_input: BatchFeature,
+        init_actions: Optional[torch.Tensor] = None,
+        deterministic: bool = False
+    ) -> BatchFeature:
+        """Optimized DDIM inference path that preserves the original math."""
+        if self.config.sampling_method != 'ddim':
+            return self.get_action(vl_features, action_input, init_actions, deterministic)
+
+        vl_embeds = self.feature_encoder(vl_features)
+        history_embeds = self.his_traj_encoder(
+            action_input.his_traj.unsqueeze(1)
+        ).repeat(1, self.config.action_horizon, 1)
+        ego_embeds = self.ego_status_encoder(action_input.status_feature)
+
+        B, D = vl_embeds.shape[0], self.config.action_dim
+        device, dtype = vl_embeds.device, vl_embeds.dtype
+        current_actions = init_actions if init_actions is not None else torch.randn(
+            (B, self.config.action_horizon, D), device=device, dtype=dtype
+        )
+
+        vl_embeds_mean = vl_embeds.mean(1).unsqueeze(1).repeat(1, self.config.action_horizon, 1)
+        action_pos_embedding = None
+        if hasattr(self, 'position_embedding'):
+            action_pos_embedding = self.position_embedding(
+                torch.arange(self.config.action_horizon, device=device)
+            )
+
+        eta_tensor = None if deterministic else self.eta(current_actions).unsqueeze(1)
+        eval_min_sampling_denoising_std = getattr(self, 'eval_min_sampling_denoising_std', 0.0001)
+        eval_randn_clip_value = getattr(self, 'eval_randn_clip_value', 1.0)
+        cross_attn_kv_cache = self.model.build_cross_attention_kv_cache(vl_embeds)
+
+        t_batches = [self.make_timesteps(B, self.ddim_t[i], device) for i in range(self.ddim_steps)]
+        index_batches = [self.make_timesteps(B, i, device) for i in range(self.ddim_steps)]
+
+        for i in range(self.ddim_steps):
+            mean, logvar, _ = self._p_mean_variance_fast_ddim(
+                current_actions,
+                t_batches[i],
+                index_batches[i],
+                vl_embeds,
+                vl_embeds_mean,
+                history_embeds,
+                ego_embeds,
+                action_pos_embedding,
+                eta_tensor,
+                cross_attn_kv_cache,
+                deterministic,
+            )
+
+            std = torch.exp(0.5 * logvar).to(dtype)
+            noise_sample = torch.randn_like(current_actions)
+
+            if deterministic:
+                std.zero_()
+            else:
+                std = std.clamp(min=eval_min_sampling_denoising_std)
+
+            noise_sample.clamp_(-eval_randn_clip_value, eval_randn_clip_value)
+            current_actions = mean + std * noise_sample
+
+        final_action_clip_value = getattr(self, 'final_action_clip_value', 1.0)
+        if final_action_clip_value is not None:
+            current_actions.clamp_(-final_action_clip_value, final_action_clip_value)
+
+        final_actions = self.denorm_odo(current_actions)
+        return BatchFeature(data={"pred_traj": final_actions})
+
     def sample_chain(
         self,
         vl_features: torch.Tensor,

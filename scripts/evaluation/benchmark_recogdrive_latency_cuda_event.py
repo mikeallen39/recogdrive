@@ -194,7 +194,7 @@ def run_profiled_backbone(backbone, pixel_values, questions, num_patches_list):
     return profile, outputs
 
 
-def run_one(agent, agent_input):
+def run_one(agent, agent_input, image_max_num, action_getter=None):
     feature_wall_ms, features = wall_time_ms(lambda: make_agent_input_features(agent, agent_input))
 
     history_trajectory = features["history_trajectory"].cuda()
@@ -203,7 +203,9 @@ def run_one(agent, agent_input):
     image_path_tensor = features["image_path_tensor"]
 
     image_paths = agent._decode_paths_from_tensor(image_path_tensor)
-    image_wall_ms, pixel_values_list = wall_time_ms(lambda: [load_image(path) for path in image_paths])
+    image_wall_ms, pixel_values_list = wall_time_ms(
+        lambda: [load_image(path, max_num=image_max_num) for path in image_paths]
+    )
     num_patches_list = [pixel_values.shape[0] for pixel_values in pixel_values_list]
 
     h2d_ms, pixel_values_cat = cuda_time_ms(lambda: torch.cat(pixel_values_list, dim=0).cuda())
@@ -230,9 +232,8 @@ def run_one(agent, agent_input):
             "status_feature": status_feature.to(model_dtype),
         }
     )
-    diffusion_ms, predictions = cuda_time_ms(
-        lambda: agent.action_head.get_action(last_hidden_state, action_inputs)
-    )
+    action_getter = action_getter or agent.action_head.get_action
+    diffusion_ms, predictions = cuda_time_ms(lambda: action_getter(last_hidden_state, action_inputs))
     post_wall_ms, poses = wall_time_ms(lambda: predictions["pred_traj"].float().cpu().squeeze(0))
 
     def end_to_end_gpu_only():
@@ -242,7 +243,7 @@ def run_one(agent, agent_input):
         if hidden_e2e.ndim == 2:
             hidden_e2e = hidden_e2e.unsqueeze(0)
         hidden_e2e = hidden_e2e.to(model_dtype)
-        return agent.action_head.get_action(hidden_e2e, action_inputs)
+        return action_getter(hidden_e2e, action_inputs)
 
     e2e_gpu_ms, _ = cuda_time_ms(end_to_end_gpu_only)
 
@@ -271,6 +272,10 @@ def main():
     parser.add_argument("--prune-keep-ratio", type=float, default=1.0)
     parser.add_argument("--prune-method", type=str, default="tfps")
     parser.add_argument("--diffusion-steps", type=int, default=5)
+    parser.add_argument("--image-max-num", type=int, default=12)
+    parser.add_argument("--compile-action-head", action="store_true")
+    parser.add_argument("--compile-mode", type=str, default="reduce-overhead")
+    parser.add_argument("--fast-ddim-action", action="store_true")
     args = parser.parse_args()
 
     if args.model_size == "2b":
@@ -307,6 +312,13 @@ def main():
     agent: ReCogDriveAgent = instantiate(cfg.agent)
     agent.initialize()
     agent.eval()
+    action_getter = agent.action_head.get_action_fast_ddim if args.fast_ddim_action else agent.action_head.get_action
+    if args.compile_action_head:
+        action_getter = torch.compile(
+            agent.action_head.get_action,
+            mode=args.compile_mode,
+            fullgraph=False,
+        )
 
     loader = SceneLoader(
         Path(cfg.navsim_log_path),
@@ -321,7 +333,7 @@ def main():
     records = []
     with torch.inference_mode():
         for idx, agent_input in enumerate(agent_inputs):
-            record = run_one(agent, agent_input)
+            record = run_one(agent, agent_input, args.image_max_num, action_getter=action_getter)
             record["index"] = idx
             record["warmup"] = idx < args.warmup
             records.append(record)
@@ -370,6 +382,11 @@ def main():
         "flash_attn_version": get_package_version("flash-attn"),
         "prune_keep_ratio": args.prune_keep_ratio,
         "prune_method": args.prune_method,
+        "diffusion_steps": args.diffusion_steps,
+        "image_max_num": args.image_max_num,
+        "compile_action_head": args.compile_action_head,
+        "compile_mode": args.compile_mode if args.compile_action_head else None,
+        "fast_ddim_action": args.fast_ddim_action,
         "metrics": {key: summarize(record[key] for record in measured) for key in metric_keys},
         "num_patches": summarize(record["num_patches"] for record in measured),
         "num_visual_tokens": summarize(record["num_visual_tokens"] for record in measured),

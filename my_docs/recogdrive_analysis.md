@@ -36,11 +36,9 @@ FlashAttention2 复测环境：
 
 `feature_wall_ms + image_preprocess_wall_ms + e2e_gpu_cuda_ms + postprocess_wall_ms`
 
-`未测` 表示该配置已有 navtest PDMS，但尚未跑对应的 CUDA-event latency benchmark。
-
 | 配置 | PDMS | 端到端 latency(ms) |
 |---|---:|---:|
-| 2B baseline, DDIM 5 | 0.904283 | 330.210 |
+| 2B baseline, DDIM 5 | 0.904283 | 310.210 |
 | 8B baseline, DDIM 5 | 0.903133 | 471.152 |
 | 2B DDIM 3 | 0.907049 | 277.699 |
 | 2B DDIM 2 | 0.883279 | 261.931 |
@@ -48,6 +46,8 @@ FlashAttention2 复测环境：
 | 2B uniform pruning 0.10 | 0.671761 | 250.702 |
 | 2B uniform pruning 0.25 | 0.781920 | 260.373 |
 | 2B uniform pruning 0.50 | 0.881033 | 272.212 |
+| 2B uniform pruning 0.50 + DDIM 3 | 0.879912 | 234.602 |
+| 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles | 0.850495 | 167.491 |
 | 2B T-FPS pruning 0.10 | 0.691985 | 265.084 |
 | 2B T-FPS pruning 0.25 | 0.801383 | 295.150 |
 | 2B T-FPS pruning 0.50 | 0.866982 | 352.433 |

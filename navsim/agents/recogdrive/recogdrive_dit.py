@@ -124,6 +124,7 @@ class LightningDiTBlock(nn.Module):
         conditioning: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         rotary_embedder: Optional[nn.Module] = None,
+        encoder_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         mod_params = self.adaLN_modulation(conditioning)
         shift_attn, scale_attn, gate_attn, shift_ffn, scale_ffn, gate_ffn = \
@@ -135,7 +136,8 @@ class LightningDiTBlock(nn.Module):
         attn_output = self.attn(
             modulated_states,
             encoder_hidden_states=encoder_hidden_states,
-            rotary_embedder=rotary_embedder
+            rotary_embedder=rotary_embedder,
+            encoder_kv=encoder_kv,
         )
         hidden_states = hidden_states + gate_attn.unsqueeze(1) * attn_output
 
@@ -258,3 +260,41 @@ class LightningDiT(nn.Module):
         output = self.final_layer(hidden_states, conditioning)
         
         return (output, all_hidden_states) if return_hidden_states else output
+
+    def build_cross_attention_kv_cache(
+        self, encoder_hidden_states: torch.Tensor
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        """Precompute K/V tensors for cross-attention blocks during inference."""
+        encoder_hidden_states = encoder_hidden_states.contiguous()
+        kv_cache = {}
+        for idx, block in enumerate(self.transformer_blocks):
+            use_cross_attention = not (idx % 2 == 0 and self.interleave_attention)
+            if use_cross_attention:
+                kv_cache[idx] = block.attn.project_encoder_kv(encoder_hidden_states)
+        return kv_cache
+
+    def forward_with_kv_cache(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        conditioning_features: torch.Tensor,
+        timesteps: torch.LongTensor,
+        kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        hidden_states = hidden_states.contiguous()
+        conditioning_features = conditioning_features.contiguous()
+
+        time_embedding = self.timestep_encoder(timesteps)
+        conditioning = time_embedding + conditioning_features
+
+        for idx, block in enumerate(self.transformer_blocks):
+            use_cross_attention = not (idx % 2 == 0 and self.interleave_attention)
+            hidden_states = block(
+                hidden_states,
+                conditioning=conditioning,
+                encoder_hidden_states=encoder_hidden_states if use_cross_attention else None,
+                rotary_embedder=self.rotary_embedder,
+                encoder_kv=kv_cache.get(idx) if use_cross_attention else None,
+            )
+
+        return self.final_layer(hidden_states, conditioning)
