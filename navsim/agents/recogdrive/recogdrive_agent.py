@@ -46,6 +46,7 @@ class ReCogDriveAgent(AbstractAgent):
         vlm_prune_method: str = 'tfps',
         diffusion_num_inference_steps: int = 5,
         image_max_num: int = 12,
+        image_backend: str = "pil",
     ):
         super().__init__()
         self._trajectory_sampling = trajectory_sampling
@@ -66,6 +67,7 @@ class ReCogDriveAgent(AbstractAgent):
         self.vlm_prune_method = vlm_prune_method
         self.diffusion_num_inference_steps = diffusion_num_inference_steps
         self.image_max_num = image_max_num
+        self.image_backend = image_backend
 
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
         device = f"cuda:{local_rank}"
@@ -174,7 +176,10 @@ class ReCogDriveAgent(AbstractAgent):
                 image_path_tensor = image_path_tensor.unsqueeze(0)
             image_paths = self._decode_paths_from_tensor(image_path_tensor)
             
-            pixel_values_list = [load_image(path, max_num=self.image_max_num) for path in image_paths]
+            pixel_values_list = [
+                load_image(path, max_num=self.image_max_num, backend=self.image_backend)
+                for path in image_paths
+            ]
             
             num_patches_list = [p.shape[0] for p in pixel_values_list]
             pixel_values_cat = torch.cat(pixel_values_list, dim=0).cuda()

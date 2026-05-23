@@ -48,6 +48,7 @@ FlashAttention2 复测环境：
 | 2B uniform pruning 0.50 | 0.881033 | 272.212 |
 | 2B uniform pruning 0.50 + DDIM 3 | 0.879912 | 234.602 |
 | 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles | 0.850495 | 167.491 |
+| 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + OpenCV image backend | 待测 | 133.029 |
 | 2B T-FPS pruning 0.10 | 0.691985 | 265.084 |
 | 2B T-FPS pruning 0.25 | 0.801383 | 295.150 |
 | 2B T-FPS pruning 0.50 | 0.866982 | 352.433 |
@@ -110,6 +111,31 @@ FlashAttention2 复测环境：
 - 8B + FA2 baseline 的同步完整请求 latency 约 `471 ms`，主要增加来自 VLM forward。
 - `T-FPS@0.50` 在 GPU 端已经慢于 baseline，同步完整 latency 也更高，约 `352 ms`。
 - 如果目标是实际在线端到端延迟，除了 VLM token pruning，还需要优化或异步化 CPU 图片预处理。
+
+## CPU 图片预处理 Profiling
+
+针对当前最优附近配置 `2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles`，进一步拆分 CPU 图片预处理。原始 PIL 路径主要耗时来自 `Image.open`、JPEG decode + RGB convert、`dynamic_preprocess` 中的 resize，以及最终 normalize/stack。
+
+关键观测：
+
+- 原始 PIL 路径下，单次请求图片预处理约 `55.319 ms`；更早未限制 `max_num` 的 baseline 中图片预处理为 `75-95 ms` 量级。
+- `dynamic_preprocess` 中有两次主要 resize：原图缩放到动态 tile 大小，以及生成 `448x448` thumbnail；其中 resize 是 CPU 侧最大瓶颈。
+- `Image.open` 本身只是懒加载，真正 JPEG decode 通常在后续 `convert("RGB")` 或 resize 时触发，因此 `open / decode+convert / resize` 三者在 PIL 路径里会互相耦合。
+- 改成 OpenCV backend 后，`cv2.imread + cv2.cvtColor + cv2.resize + numpy-to-torch normalize` 将图片预处理降到 `23.235 ms`。
+
+对比结果：
+
+| 配置 | 图片预处理 CPU(ms) | VLM(ms) | diffusion(ms) | e2e GPU(ms) | 完整 latency(ms) |
+|---|---:|---:|---:|---:|---:|
+| PIL backend | 55.319 | 55.578 | 54.275 | 111.935 | 167.491 |
+| OpenCV backend | 23.235 | 54.779 | 53.893 | 109.591 | 133.029 |
+
+结论：
+
+- OpenCV backend 的主要收益来自 CPU 图片解码和 resize，GPU 侧 VLM / diffusion 基本不变。
+- OpenCV 后完整 latency 从 `167.491 ms` 降到 `133.029 ms`，节省约 `34.5 ms`。
+- 该优化改变了图像预处理数值路径，因此需要以 navtest PDMS 验证精度是否保持；目前总表中 OpenCV 行的 PDMS 仍标记为待测。
+- 如果不能做预缓存，后续 CPU 侧可继续考虑更高效的在线 decode/resize 后端，但单靠图片预处理已经很难补足到 `100 ms` 内的全部差距。
 
 ## FA2 下的 2B vs 8B
 
@@ -206,6 +232,54 @@ FlashAttention2 复测环境：
 - `DDIM 3 steps` 相比默认 `5 steps` 没有精度下降，PDMS 反而高 `0.0028`；这个差异很小，但说明 2B 原始模型可以优先考虑把 diffusion steps 从 5 降到 3。
 - `DDIM 1 step` 直接崩溃，PDMS 只有 `0.0135`，主要问题是 `comfort=0`，同时 `ego_progress`、`DAC`、`TTC`、`DDC` 都大幅下降。
 - 因此 diffusion 采样步数的可用加速点目前是 `3 steps`，不是 `1 step`。
+
+## Diffusion Planner 内部 Profiling
+
+测试配置：
+
+- 模型：`2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + OpenCV image backend`
+- 功能级 profiling：`warmup=5`，有效样本 `30`
+- block-level profiling：`warmup=5`，有效样本 `10`
+- 脚本：`scripts/evaluation/profile_recogdrive_diffusion_cuda_event.py`
+- 功能级结果：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_diffusion_profile_uniform050_ddim3_maxnum6_opencv_30.json`
+- block-level 结果：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_diffusion_block_profile_uniform050_ddim3_maxnum6_opencv_10.json`
+
+功能级拆分：
+
+| 部分 | mean latency(ms) | 说明 |
+|---|---:|---|
+| profiled diffusion total | 57.693 | 细粒度打点后的总时间，略高于原始 benchmark |
+| step0 DiT forward | 16.748 | 第 1 次 denoise 的 16-layer DiT |
+| step1 DiT forward | 16.269 | 第 2 次 denoise 的 16-layer DiT |
+| step2 DiT forward | 16.162 | 第 3 次 denoise 的 16-layer DiT |
+| 3 次 DiT forward 合计 | 49.180 | diffusion 的绝对主瓶颈 |
+| DDIM update / alpha / sigma / noise 等杂项 | 2.303 | DDIM 公式、extract、randn、clamp、trajectory update |
+| action encoder | 1.042 | 当前 action + timestep 编码 |
+| action decoder | 0.531 | DiT 输出到 action noise |
+| condition encoder | 0.484 | VLM feature、history、ego status 编码 |
+| fusion projector | 0.215 | history / VLM mean / action feature 融合 |
+
+注意：
+
+- 原始可比 benchmark 中 `diffusion_cuda_ms=53.893 ms`；profiling 总时间 `57.693 ms` 更高，主要来自大量 CUDA event 打点和同步开销。
+- 因此上表应主要用于判断占比，不应替代总表中的端到端 latency。
+
+block-level profiling 结论：
+
+| DiT block 内部部分 | 16 blocks 合计 mean(ms) |
+|---|---:|
+| attention | 9.259 |
+| FFN | 1.978 |
+| modulate / norm / residual / adaLN 等 pointwise | 6.804 |
+
+block-level profiling 会显著增加同步开销，带打点时 `profiled diffusion total=87.225 ms`，所以不能直接和原始 latency 对比。但它说明 DiT 内部并不是单一 FFN/GEMM 瓶颈，attention 与大量小算子、norm、modulation、residual 都有明显占比。
+
+优化含义：
+
+- 不减少 DDIM step 数时，diffusion 主要优化对象是每次 DiT forward，而不是 DDIM update 公式；DDIM 杂项只有 `~2.3 ms`。
+- `DDIM 3 -> 2` 是 training-free 下最直接减少计算量的方法，理论上可以少一次 `~16 ms` DiT forward，但需要验证 PDMS。
+- 面向 910B 部署时，应优先把 diffusion planner 整理成固定 shape、无动态控制流的独立子图，便于后续 CANN/ATC/MindIE 编译和算子融合。
+- W8A8 只量化 Linear 未必能显著降低 diffusion 延迟，因为当前瓶颈还包含 attention、RMSNorm/AdaLN/modulate/residual 等大量非 Linear 小算子。
 
 ## 2B-RL + 视觉 Token Pruning Navtest 精度
 

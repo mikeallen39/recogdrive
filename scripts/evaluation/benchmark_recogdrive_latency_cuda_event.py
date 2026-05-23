@@ -194,7 +194,7 @@ def run_profiled_backbone(backbone, pixel_values, questions, num_patches_list):
     return profile, outputs
 
 
-def run_one(agent, agent_input, image_max_num, action_getter=None):
+def run_one(agent, agent_input, image_max_num, image_backend, action_getter=None):
     feature_wall_ms, features = wall_time_ms(lambda: make_agent_input_features(agent, agent_input))
 
     history_trajectory = features["history_trajectory"].cuda()
@@ -204,7 +204,7 @@ def run_one(agent, agent_input, image_max_num, action_getter=None):
 
     image_paths = agent._decode_paths_from_tensor(image_path_tensor)
     image_wall_ms, pixel_values_list = wall_time_ms(
-        lambda: [load_image(path, max_num=image_max_num) for path in image_paths]
+        lambda: [load_image(path, max_num=image_max_num, backend=image_backend) for path in image_paths]
     )
     num_patches_list = [pixel_values.shape[0] for pixel_values in pixel_values_list]
 
@@ -273,6 +273,7 @@ def main():
     parser.add_argument("--prune-method", type=str, default="tfps")
     parser.add_argument("--diffusion-steps", type=int, default=5)
     parser.add_argument("--image-max-num", type=int, default=12)
+    parser.add_argument("--image-backend", type=str, default="pil", choices=["pil", "pil_draft", "pil_parallel", "opencv"])
     parser.add_argument("--compile-action-head", action="store_true")
     parser.add_argument("--compile-mode", type=str, default="reduce-overhead")
     parser.add_argument("--fast-ddim-action", action="store_true")
@@ -333,7 +334,13 @@ def main():
     records = []
     with torch.inference_mode():
         for idx, agent_input in enumerate(agent_inputs):
-            record = run_one(agent, agent_input, args.image_max_num, action_getter=action_getter)
+            record = run_one(
+                agent,
+                agent_input,
+                args.image_max_num,
+                args.image_backend,
+                action_getter=action_getter,
+            )
             record["index"] = idx
             record["warmup"] = idx < args.warmup
             records.append(record)
@@ -384,6 +391,7 @@ def main():
         "prune_method": args.prune_method,
         "diffusion_steps": args.diffusion_steps,
         "image_max_num": args.image_max_num,
+        "image_backend": args.image_backend,
         "compile_action_head": args.compile_action_head,
         "compile_mode": args.compile_mode if args.compile_action_head else None,
         "fast_ddim_action": args.fast_ddim_action,
