@@ -10,15 +10,23 @@ from torchvision.transforms.functional import InterpolationMode
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 _TARGET_RATIOS_CACHE = {}
+_TRANSFORM_CACHE = {}
 
-def build_transform(input_size):
+def build_transform(input_size, resize=True):
+    key = (input_size, resize)
+    if key in _TRANSFORM_CACHE:
+        return _TRANSFORM_CACHE[key]
+
     MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
-    transform = T.Compose([
+    transforms = [
         T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
         T.ToTensor(),
         T.Normalize(mean=MEAN, std=STD)
-    ])
+    ]
+    if resize:
+        transforms.insert(1, T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC))
+    transform = T.Compose(transforms)
+    _TRANSFORM_CACHE[key] = transform
     return transform
 
 def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
@@ -121,6 +129,10 @@ def normalize_numpy_images(images):
     std = torch.tensor(IMAGENET_STD, dtype=tensor.dtype).view(1, 3, 1, 1)
     return (tensor - mean) / std
 
+def normalize_pil_images_numpy(images):
+    arrays = [np.asarray(image, dtype=np.uint8) for image in images]
+    return normalize_numpy_images(arrays)
+
 def load_image_opencv(image_file, input_size=448, max_num=12):
     import cv2
 
@@ -172,13 +184,18 @@ def load_image(image_file, input_size=448, max_num=12, backend="pil"):
     else:
         image = Image.open(image_file).convert('RGB')
 
-    transform = build_transform(input_size=input_size)
-    if backend == "pil_parallel":
+    numpy_normalize = backend in {"pil_numpy", "pil_parallel_numpy"}
+    no_resize = backend in {"pil_no_resize", "pil_parallel_no_resize"} or numpy_normalize
+    transform = build_transform(input_size=input_size, resize=not no_resize)
+    if backend in {"pil_parallel", "pil_parallel_no_resize", "pil_parallel_numpy"}:
         images = dynamic_preprocess_parallel(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
-    elif backend in {"pil", "pil_draft"}:
+    elif backend in {"pil", "pil_draft", "pil_no_resize", "pil_numpy"}:
         images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
     else:
         raise ValueError(f"Unsupported image preprocessing backend: {backend}")
-    pixel_values = [transform(image) for image in images]
-    pixel_values = torch.stack(pixel_values)
+    if numpy_normalize:
+        pixel_values = normalize_pil_images_numpy(images)
+    else:
+        pixel_values = [transform(image) for image in images]
+        pixel_values = torch.stack(pixel_values)
     return pixel_values

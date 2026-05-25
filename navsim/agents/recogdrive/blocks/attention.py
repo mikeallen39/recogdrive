@@ -6,6 +6,20 @@ from typing import Optional, Tuple
 from .rmsnorm import RMSNorm
 from .rope import RotaryEmbedding, rotate_half
 
+
+def _contiguous_rotary_embeddings(rotary_embedder: nn.Module, x: torch.Tensor, seq_len: int):
+    if not hasattr(rotary_embedder, "cos_cached") or not hasattr(rotary_embedder, "sin_cached"):
+        position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0)
+        return rotary_embedder(x, position_ids)
+
+    if seq_len > getattr(rotary_embedder, "max_seq_len_cached", 0):
+        rotary_embedder._set_cos_sin_cache(seq_len=seq_len, device=x.device)
+
+    cos = rotary_embedder.cos_cached[:, :, :seq_len, :]
+    sin = rotary_embedder.sin_cached[:, :, :seq_len, :]
+    return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
 class Attention(nn.Module):
     """
     A versatile and highly configurable attention module.
@@ -69,8 +83,7 @@ class Attention(nn.Module):
         q = self.q_norm(q)
         
         if rotary_embedder is not None:
-            position_ids = torch.arange(N_q, device=hidden_states.device).unsqueeze(0)
-            cos, sin = rotary_embedder(hidden_states, position_ids)
+            cos, sin = _contiguous_rotary_embeddings(rotary_embedder, hidden_states, N_q)
             q = (q * cos) + (rotate_half(q) * sin)
             
             if is_self_attention:

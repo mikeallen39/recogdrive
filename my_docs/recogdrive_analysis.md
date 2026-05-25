@@ -48,7 +48,8 @@ FlashAttention2 复测环境：
 | 2B uniform pruning 0.50 | 0.881033 | 272.212 |
 | 2B uniform pruning 0.50 + DDIM 3 | 0.879912 | 234.602 |
 | 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles | 0.850495 | 167.491 |
-| 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + OpenCV image backend | 待测 | 133.029 |
+| 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + OpenCV image backend | 0.837151 | 133.029 |
+| 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + OpenCV + addcmul pointwise fusion | 同 OpenCV 行（数值等价） | 129.471 |
 | 2B T-FPS pruning 0.10 | 0.691985 | 265.084 |
 | 2B T-FPS pruning 0.25 | 0.801383 | 295.150 |
 | 2B T-FPS pruning 0.50 | 0.866982 | 352.433 |
@@ -134,8 +135,66 @@ FlashAttention2 复测环境：
 
 - OpenCV backend 的主要收益来自 CPU 图片解码和 resize，GPU 侧 VLM / diffusion 基本不变。
 - OpenCV 后完整 latency 从 `167.491 ms` 降到 `133.029 ms`，节省约 `34.5 ms`。
-- 该优化改变了图像预处理数值路径，因此需要以 navtest PDMS 验证精度是否保持；目前总表中 OpenCV 行的 PDMS 仍标记为待测。
+- OpenCV 后 navtest PDMS 为 `0.837151`，相比同配置 PIL backend 的 `0.850495` 下降 `0.013344`。
 - 如果不能做预缓存，后续 CPU 侧可继续考虑更高效的在线 decode/resize 后端，但单靠图片预处理已经很难补足到 `100 ms` 内的全部差距。
+
+OpenCV 精度结果：
+
+- 结果文件：`/data/zxz/HUAWEI/VLA/navsim_data/exp/recogdrive_agent_eval_2b_prune_uniform_050_ddim3_maxnum6_opencv_zxz/2026.05.23.02.15.45/2026.05.23.03.36.02.csv`
+- 成功场景：`12146/12146`
+- failed：`0`
+
+| 配置 | PDMS | NC | DAC | EP | TTC | C | DDC |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| PIL backend | 0.850495 | - | - | - | - | - | - |
+| OpenCV backend | 0.837151 | 0.951301 | 0.936605 | 0.814433 | 0.890746 | 1.000000 | 0.957393 |
+
+精度下降拆分：
+
+- 相比原始 2B baseline `0.904283`，当前 OpenCV 配置总下降 `0.067132`。
+- 其中 `uniform@0.50 + DDIM3` 本身仍有 `0.879912`，相对 baseline 只下降 `0.024371`。
+- `image max_num=6 / 3 tiles` 将 PDMS 从 `0.879912` 降到 `0.850495`，额外下降 `0.029417`，这是更主要的精度损失来源。
+- OpenCV backend 再从 `0.850495` 降到 `0.837151`，额外下降 `0.013344`。
+
+原因判断：
+
+- `max_num=6 / 3 tiles` 会减少动态 tiling 覆盖的视野细节；虽然仍是前视单图，但 tile 数减少会影响远处小目标、车道边界和局部几何信息，因此 PDMS 会下降。
+- OpenCV 路径与原 PIL/torchvision 路径不完全数值等价：JPEG decode、RGB 转换、resize interpolation、rounding、归一化执行顺序都可能产生像素级差异。VLM 对这类输入分布差异比较敏感，尤其当前已经叠加 `uniform@0.50` token pruning 和 `3 tiles` 压缩，鲁棒性余量更小。
+- 因此这次“掉得挺多”不是单一 OpenCV 造成的，而是 `tile 数减少` 是主要项，`OpenCV 预处理数值差异` 是次要但可见项。
+
+### PIL Backend 保精度优化
+
+为避免 OpenCV 数值路径导致 PDMS 下降，进一步测试了只优化 PIL 路径的 backend：
+
+- `pil_no_resize`：保留 `Image.open().convert("RGB")`、`dynamic_preprocess()`、crop 和 thumbnail，只去掉 tile 后 `torchvision.Resize(448,448)`。
+- `pil_parallel`：保留原 transform，但并行执行 dynamic grid resize 和 thumbnail resize。
+- `pil_parallel_no_resize`：同时启用 parallel resize 和 no-resize transform。
+
+像素等价性检查：
+
+- 抽取 20 张 navtest 前视图，对比原 `pil` 与 `pil_no_resize` / `pil_parallel` / `pil_parallel_no_resize` 的输出 tensor。
+- 三个 PIL 优化 backend 均为 `max_abs_diff=0.0`、`mean_abs_diff=0.0`，`num_patches` 和 shape 完全一致。
+- 因此这些 backend 理论上与原 PIL 数值等价，不需要像 OpenCV 一样额外担心 PDMS 下降。
+
+结果文件：
+
+- pil：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/pil_backend_2b_uniform050_ddim3_maxnum6_addcmul_pil_50.json`
+- pil no resize：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/pil_backend_2b_uniform050_ddim3_maxnum6_addcmul_pil_no_resize_50.json`
+- pil parallel：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/pil_backend_2b_uniform050_ddim3_maxnum6_addcmul_pil_parallel_50.json`
+- pil parallel no resize：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/pil_backend_2b_uniform050_ddim3_maxnum6_addcmul_pil_parallel_no_resize_50.json`
+
+| backend | 图片预处理 CPU mean(ms) | e2e GPU mean(ms) | 完整 latency mean(ms) | 与原 PIL tensor 等价 |
+|---|---:|---:|---:|---|
+| pil | 79.704 | 96.547 | 176.441 | - |
+| pil_no_resize | 52.412 | 95.710 | 148.319 | 是 |
+| pil_parallel | 41.220 | 96.299 | 137.708 | 是 |
+| pil_parallel_no_resize | 41.395 | 94.597 | 136.188 | 是 |
+
+结论：
+
+- `pil_no_resize` 证明 `torchvision.Resize(448,448)` 是冗余开销，去掉后 tensor 与原 PIL 完全一致，图片预处理下降约 `27.3 ms`。
+- `pil_parallel` / `pil_parallel_no_resize` 进一步把图片预处理降到约 `41 ms`，完整 latency 约 `136 ms`，接近 OpenCV 的 `133 ms`，但保持原 PIL tensor 完全等价。
+- 当前最推荐的保精度图片 backend 是 `pil_parallel_no_resize`；相比 OpenCV，它牺牲约 `3 ms` latency，但避免了 OpenCV 额外 `0.013344` PDMS 下降风险。
 
 ## FA2 下的 2B vs 8B
 
@@ -280,6 +339,97 @@ block-level profiling 会显著增加同步开销，带打点时 `profiled diffu
 - `DDIM 3 -> 2` 是 training-free 下最直接减少计算量的方法，理论上可以少一次 `~16 ms` DiT forward，但需要验证 PDMS。
 - 面向 910B 部署时，应优先把 diffusion planner 整理成固定 shape、无动态控制流的独立子图，便于后续 CANN/ATC/MindIE 编译和算子融合。
 - W8A8 只量化 Linear 未必能显著降低 diffusion 延迟，因为当前瓶颈还包含 attention、RMSNorm/AdaLN/modulate/residual 等大量非 Linear 小算子。
+
+### Pointwise Fusion 尝试
+
+进一步测试了 DiT block 中 pointwise 写法的低风险等价改写。该实验不改变权重、DDIM 采样步数、随机噪声分布或模型结构，只改变部分逐元素表达式：
+
+- baseline：原始写法，`x * (1 + scale) + shift`，residual 为 `hidden + gate * output`。
+- `addcmul_residual`：只把 gated residual 改成 `torch.addcmul(hidden, output, gate)`。
+- `addcmul_pointwise`：把 modulation 改成 `torch.addcmul(shift, x, 1 + scale)`，同时 residual 使用 `torch.addcmul`。
+
+结果文件：
+
+- baseline：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/fusion_ablation_baseline_50.json`
+- addcmul residual：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/fusion_ablation_addcmul_residual_50.json`
+- addcmul pointwise：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/fusion_ablation_addcmul_pointwise_50.json`
+
+| 版本 | diffusion(ms) | e2e GPU(ms) | 完整 latency(ms) |
+|---|---:|---:|---:|
+| baseline | 54.793 | 113.481 | 139.180 |
+| addcmul residual only | 54.721 | 113.846 | 139.923 |
+| addcmul pointwise | 45.999 | 103.277 | 129.471 |
+
+输出等价性检查：
+
+- 固定同一输入、同一随机种子，对比 baseline 与 `addcmul_pointwise`。
+- `max_abs_diff=1.9073486328125e-06`
+- `mean_abs_diff=1.738468853318409e-07`
+- 首个轨迹点输出完全一致到打印精度：`[3.138187885284424, 0.009815216064453125, 0.0024843215942382812]`
+
+结论：
+
+- 只改 residual 基本没有收益，说明 `hidden + gate * output` 不是主要瓶颈。
+- `addcmul_pointwise` 将 diffusion 从 `54.793 ms` 降到 `45.999 ms`，节省约 `8.8 ms`；e2e GPU 从 `113.481 ms` 降到 `103.277 ms`，节省约 `10.2 ms`。
+- 输出差异只有 `1e-6` 量级，属于浮点表达式重排误差；因此这里不再单独跑 navtest PDMS。
+- 该结果说明 diffusion 中 `modulate / norm / residual / adaLN` 一类 pointwise 表达式确实值得面向 910B 做静态子图和算子融合。
+
+### Attention / RoPE 优化尝试
+
+进一步检查 DiT attention 后，当前最确定的 training-free 优化点是 RoPE 路径，而不是 SDPA 本身：
+
+- 原始 RoPE 每个 attention forward 都构造 `position_ids=torch.arange(N_q)`，再调用 `rotary_embedder()`，内部包含 `position_ids.max().item()` 和 `gather`。
+- diffusion planner 的 action query 长度固定为连续位置，因此可以直接切 `cos_cached[:, :, :N_q, :]` 和 `sin_cached[:, :, :N_q, :]`，避免动态 tensor 创建、CPU sync 风险和 gather。
+- 该优化已经迁移到实际 `navsim/agents/recogdrive/blocks/attention.py`，并保留 fallback：如果传入的 rotary embedder 不是当前 cache 实现，则回退原始 `position_ids + rotary_embedder()` 路径。
+- `scripts/evaluation/benchmark_recogdrive_latency_cuda_event.py` 增加了 `--sdpa-backend {auto,flash,math,efficient,cudnn}`，用于后续在空卡上单独测试 SDPA backend；该开关只包住 diffusion planner，不影响 VLM。
+
+低层等价性检查：
+
+- 固定同一个 `Attention` 权重、输入和 RoPE cache，对比原始 `position_ids + gather` 路径与直接 slice 路径。
+- `max_abs_diff=0.0`
+- `mean_abs_diff=0.0`
+
+已完成的 latency ablation 结果如下。注意：这批 attention 实验运行时 CPU/full latency 有明显噪声，下面优先看 `diffusion_cuda_ms` 和 `e2e_gpu_cuda_ms`。
+
+| 版本 | diffusion mean(ms) | diffusion trimmed mean(ms) | e2e GPU mean(ms) | e2e GPU trimmed mean(ms) |
+|---|---:|---:|---:|---:|
+| baseline | 54.793 | 54.561 | 113.481 | 112.929 |
+| baseline + RoPE slice | 52.558 | 52.004 | 116.982 | 109.887 |
+| addcmul pointwise | 45.999 | 45.530 | 103.277 | 103.063 |
+| addcmul pointwise + RoPE slice | 43.468 | 42.341 | 102.414 | 99.833 |
+| addcmul pointwise + RoPE slice + RoPE addcmul | 42.936 | 42.011 | 105.060 | 99.930 |
+
+结论：
+
+- RoPE slice 对 diffusion 有稳定收益：baseline 上约 `2.2-2.6 ms`，叠加 `addcmul_pointwise` 后约 `2.5-3.2 ms`。
+- `RoPE addcmul` 相比普通 RoPE slice 的收益很小，且 e2e GPU mean 更噪，不建议优先作为主路径；默认实现保持普通表达式更稳。
+- SDPA 本身目前仍使用 PyTorch 默认 `scaled_dot_product_attention` 自动 backend。由于 action query 长度只有 `8`，attention 的 GEMM/softmax 并不是唯一瓶颈，强制 backend 未必一定更快；需要在空卡上用新增 `--sdpa-backend` 逐项实测。
+- 面向 910B，这类优化的价值不只是 A800 上节省几毫秒，更重要的是去掉动态 shape 辅助算子、`.item()` 和 gather，使 diffusion 子图更容易被 CANN/ATC/MindIE 做静态编译和融合。
+
+SDPA backend ablation：
+
+- 测试配置：`2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + OpenCV + addcmul pointwise + RoPE slice`
+- 测试 GPU：A800 GPU0，`warmup=5`，有效样本 `50`
+- 结果文件：
+- auto：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/sdpa_ablation_2b_uniform050_ddim3_maxnum6_opencv_addcmul_auto_50.json`
+- math：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/sdpa_ablation_2b_uniform050_ddim3_maxnum6_opencv_addcmul_math_50.json`
+- efficient：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/sdpa_ablation_2b_uniform050_ddim3_maxnum6_opencv_addcmul_efficient_50.json`
+- flash / cudnn：运行失败，无有效 JSON。
+
+| SDPA backend | 状态 | diffusion mean(ms) | diffusion trimmed mean(ms) | e2e GPU mean(ms) | e2e GPU trimmed mean(ms) |
+|---|---|---:|---:|---:|---:|
+| auto | 成功 | 41.812 | 41.721 | 98.274 | 98.012 |
+| efficient | 成功 | 42.178 | 42.039 | 99.705 | 99.571 |
+| math | 成功 | 48.734 | 48.509 | 105.795 | 105.610 |
+| flash | 失败 | - | - | - | - |
+| cudnn | 失败 | - | - | - | - |
+
+补充说明：
+
+- `auto` 是当前最优选择，diffusion 比强制 `efficient` 略快 `~0.3 ms`，e2e GPU 略快 `~1.4-1.6 ms`。
+- `math` 明显更慢，不应作为部署路径。
+- `flash` 和 `cudnn` 失败原因是 diffusion planner 当前 attention 的 Q/K/V 为 `float32`，PyTorch flash/cudnn SDPA 要求 Q/K/V 为 `float16` 或 `bfloat16`。
+- 这说明单纯切 SDPA backend 没有明显额外空间；如果要继续挖 attention，需要考虑把 action head 的 attention 子路径安全降到 fp16/bf16 或针对 910B 做静态图融合，而不是强制 PyTorch backend。
 
 ## 2B-RL + 视觉 Token Pruning Navtest 精度
 
