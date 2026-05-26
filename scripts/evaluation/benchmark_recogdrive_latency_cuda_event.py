@@ -64,10 +64,16 @@ def get_package_version(package_name):
 
 
 def install_dit_pointwise_variant(action_head, variant):
+    if variant not in {"addcmul_residual", "addcmul_pointwise"}:
+        if variant != "baseline":
+            raise ValueError(f"Unsupported DiT pointwise variant: {variant}")
+
+    if hasattr(action_head.model, "set_pointwise_variant"):
+        action_head.model.set_pointwise_variant(variant)
+        return
+
     if variant == "baseline":
         return
-    if variant not in {"addcmul_residual", "addcmul_pointwise"}:
-        raise ValueError(f"Unsupported DiT pointwise variant: {variant}")
 
     def modulate_addcmul(x, shift, scale):
         scale = scale.unsqueeze(1).add(1.0)

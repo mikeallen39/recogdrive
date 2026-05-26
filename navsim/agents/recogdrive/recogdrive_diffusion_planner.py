@@ -682,13 +682,14 @@ class ReCogDriveDiffusionPlanner(nn.Module):
 
         alpha_t = self.extract(self.ddim_alphas, index, x.shape)
         sqrt_one_minus_alpha_t = self.extract(self.ddim_sqrt_one_minus_alphas, index, x.shape)
-        x_recon = (x - sqrt_one_minus_alpha_t * pred_noise) / (alpha_t**0.5)
+        alpha_t_sqrt = alpha_t.sqrt()
+        x_recon = torch.addcmul(x, pred_noise, -sqrt_one_minus_alpha_t) / alpha_t_sqrt
 
         denoised_clip_value = getattr(self, 'denoised_clip_value', 1.0)
         x_recon.clamp_(-denoised_clip_value, denoised_clip_value)
 
         alpha_prev = self.extract(self.ddim_alphas_prev, index, x.shape)
-        pred_noise = (x - (alpha_t**0.5) * x_recon) / sqrt_one_minus_alpha_t
+        pred_noise = torch.addcmul(x, x_recon, -alpha_t_sqrt) / sqrt_one_minus_alpha_t
 
         eps_clip_value = getattr(self, 'eps_clip_value', None)
         if eps_clip_value is not None:
@@ -701,7 +702,7 @@ class ReCogDriveDiffusionPlanner(nn.Module):
         ).clamp_(min=1e-10)
 
         pred_dir_xt = (1.0 - alpha_prev - sigma**2).clamp(min=0).sqrt() * pred_noise
-        model_mean = (alpha_prev**0.5) * x_recon + pred_dir_xt
+        model_mean = torch.addcmul(pred_dir_xt, x_recon, alpha_prev.sqrt())
         model_log_variance = torch.log(sigma**2 + 1e-20)
 
         return model_mean, model_log_variance, x_recon
@@ -720,7 +721,7 @@ class ReCogDriveDiffusionPlanner(nn.Module):
         vl_embeds = self.feature_encoder(vl_features)
         history_embeds = self.his_traj_encoder(
             action_input.his_traj.unsqueeze(1)
-        ).repeat(1, self.config.action_horizon, 1)
+        ).expand(-1, self.config.action_horizon, -1)
         ego_embeds = self.ego_status_encoder(action_input.status_feature)
 
         B, D = vl_embeds.shape[0], self.config.action_dim
@@ -729,7 +730,7 @@ class ReCogDriveDiffusionPlanner(nn.Module):
             (B, self.config.action_horizon, D), device=device, dtype=dtype
         )
 
-        vl_embeds_mean = vl_embeds.mean(1).unsqueeze(1).repeat(1, self.config.action_horizon, 1)
+        vl_embeds_mean = vl_embeds.mean(1).unsqueeze(1).expand(-1, self.config.action_horizon, -1)
         action_pos_embedding = None
         if hasattr(self, 'position_embedding'):
             action_pos_embedding = self.position_embedding(

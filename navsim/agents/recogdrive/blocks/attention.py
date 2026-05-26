@@ -84,10 +84,10 @@ class Attention(nn.Module):
         
         if rotary_embedder is not None:
             cos, sin = _contiguous_rotary_embeddings(rotary_embedder, hidden_states, N_q)
-            q = (q * cos) + (rotate_half(q) * sin)
+            q = torch.addcmul(q * cos, rotate_half(q), sin)
             
             if is_self_attention:
-                k = (k * cos) + (rotate_half(k) * sin)
+                k = torch.addcmul(k * cos, rotate_half(k), sin)
 
         if hasattr(F, 'scaled_dot_product_attention'):
             x = F.scaled_dot_product_attention(

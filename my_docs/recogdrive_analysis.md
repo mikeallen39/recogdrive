@@ -265,6 +265,93 @@ OpenCV 精度结果：
 - 因此 `0.50` keep ratio 变慢的直接原因是 T-FPS selection 成本过高；它的计算开销超过了减少 LLM token 后得到的收益。
 - 如果继续沿这个方向优化，优先考虑低成本 selection，例如 uniform、score/top-k、分块近似 FPS，或者在 vision encoder 内部提前 prune，而不是 `extract_feature()` 之后做全量 T-FPS。
 
+### VLM 内部算子 Profiling
+
+为判断 VLM 后续应该优先优化 `linear/GEMM`、attention 还是其他小算子，对当前主力配置做了 VLM 内部算子级 profiling。
+
+测试配置：
+
+- 模型：`ReCogDrive-VLM-2B / InternVL`
+- 配置：`uniform pruning 0.50 + image max_num 6 / 3 tiles`
+- 输入：`visual tokens=384`，`input seq len=870`
+- 精度：VLM 为 `bfloat16`
+- GPU：A800 GPU4
+- 结果文件：
+- 原始 profiler：`/data/zxz/HUAWEI/VLA/navsim_data/exp/profile/vlm_internal_2b_uniform050_maxnum6_gpu4.json`
+- 高层 op 过滤版：`/data/zxz/HUAWEI/VLA/navsim_data/exp/profile/vlm_internal_2b_uniform050_maxnum6_gpu4_ops_only.json`
+
+注意统计口径：
+
+- CUDA event 是实际 forward 的端到端 GPU stream 时间，最适合和 latency 总表对齐。
+- profiler 表中只统计高层 op 的 `self CUDA time`，用于判断算子占比；它不包含 PyTorch eager dispatch、kernel launch 间隙、stream idle、metadata/view 等无 CUDA kernel 的调度开销。
+- 因此 profiler 各项相加不一定等于 CUDA event。LLM 中这个差值约 `6.35 ms`，说明除 GEMM 外还有明显的 launch/调度碎片。
+
+Vision encoder 结果：
+
+| 类别 | self CUDA time(ms) | 占高层 op self time |
+|---|---:|---:|
+| linear / GEMM | 9.015 | 52.3% |
+| bicubic upsample / other | 2.367 | 13.7% |
+| FlashAttention2 | 2.298 | 13.3% |
+| pointwise | 1.224 | 7.1% |
+| GELU / activation | 0.972 | 5.6% |
+| LayerNorm | 0.793 | 4.6% |
+| patch embedding conv | 0.455 | 2.6% |
+| memory / shape / index | 0.115 | 0.7% |
+
+Vision encoder CUDA event：`17.49 ms`。主要 top ops：
+
+| op | self CUDA time(ms) | calls/iter |
+|---|---:|---:|
+| `aten::addmm` | 9.015 | 98 |
+| `aten::upsample_bicubic2d` | 2.367 | 1 |
+| `flash_attn::_flash_attn_varlen_forward` | 2.298 | 24 |
+| `aten::gelu` | 0.972 | 25 |
+| `aten::native_layer_norm` | 0.793 | 49 |
+
+Vision encoder 结论：
+
+- 主要瓶颈是 `linear/GEMM`，不是 attention；FA2 attention 只占高层 op self time 的约 `13.3%`。
+- `aten::upsample_bicubic2d` 单次约 `2.37 ms`，占比接近 attention，值得单独排查。它大概率来自 ViT 位置编码/输入相关 interpolation；如果 tile shape 固定，后续可尝试缓存固定位置编码或避免每次动态 bicubic resize。
+- patch embedding conv 只有 `0.46 ms`，不是主要优化点。
+
+LLM 结果：
+
+| 类别 | self CUDA time(ms) | 占高层 op self time |
+|---|---:|---:|
+| linear / GEMM | 15.497 | 65.6% |
+| pointwise / RMSNorm 相关 | 3.922 | 16.6% |
+| memory / copy / cat | 1.582 | 6.7% |
+| FlashAttention2 | 1.275 | 5.4% |
+| other | 0.729 | 3.1% |
+| SiLU / activation | 0.624 | 2.6% |
+
+LLM CUDA event：`29.98 ms`。高层 op self time 合计：`23.63 ms`，差值约 `6.35 ms`。主要 top ops：
+
+| op | self CUDA time(ms) | calls/iter |
+|---|---:|---:|
+| `aten::mm` | 14.139 | 113 |
+| `aten::mul` | 2.397 | 256 |
+| `aten::addmm` | 1.356 | 84 |
+| `flash_attn::_flash_attn_forward` | 1.275 | 28 |
+| `aten::copy_` | 0.971 | 117 |
+| `aten::add` | 0.789 | 170 |
+| `aten::silu` | 0.624 | 28 |
+| `aten::cat` | 0.611 | 57 |
+
+LLM 结论：
+
+- LLM 主要瓶颈是 `linear/GEMM`，约占高层 op self time 的 `65.6%`。
+- attention 在 FA2 下只有 `~1.28 ms`，约 `5.4%`，继续切 attention backend 的收益很小。
+- `mul/add/copy/cat/silu/RMSNorm` 等小算子和 launch 间隙累计明显。CUDA event 与高层 op self time 的 `~6.35 ms` 差值说明 PyTorch eager 的 kernel launch / 调度碎片约占 LLM forward 的 `20%`。
+- 后续 LLM 优化优先级：减少 token/seq len > GEMM 量化或高效线性算子 > RMSNorm/SwiGLU/pointwise 融合。attention 不是当前优先方向。
+
+整体判断：
+
+- VLM 的两个主要模块都不是 attention 主导，而是 GEMM 主导。
+- Vision encoder 的额外可疑点是 `bicubic upsample`，这部分比单个小算子更值得优先排查。
+- 如果最终面向 910B，VLM 优化应重点关注静态 shape、GEMM 量化/高效 matmul、RMSNorm/SwiGLU/pointwise 融合，以及 position interpolation 这类可缓存常量路径。
+
 ## 2B-RL + Diffusion Steps Navtest 精度
 
 测试设置：

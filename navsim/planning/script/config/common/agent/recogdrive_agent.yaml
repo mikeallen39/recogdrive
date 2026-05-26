@@ -23,5 +23,7 @@ vlm_prune_method: 'tfps'
 diffusion_num_inference_steps: 5
 image_max_num: 12
 image_backend: 'pil'
+dit_pointwise_variant: 'baseline'
+fast_ddim_action: false
 grpo: False
 lr: 1e-4

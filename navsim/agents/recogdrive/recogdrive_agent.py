@@ -47,6 +47,8 @@ class ReCogDriveAgent(AbstractAgent):
         diffusion_num_inference_steps: int = 5,
         image_max_num: int = 12,
         image_backend: str = "pil",
+        dit_pointwise_variant: str = "baseline",
+        fast_ddim_action: bool = False,
     ):
         super().__init__()
         self._trajectory_sampling = trajectory_sampling
@@ -68,6 +70,8 @@ class ReCogDriveAgent(AbstractAgent):
         self.diffusion_num_inference_steps = diffusion_num_inference_steps
         self.image_max_num = image_max_num
         self.image_backend = image_backend
+        self.dit_pointwise_variant = dit_pointwise_variant
+        self.fast_ddim_action = fast_ddim_action
 
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
         device = f"cuda:{local_rank}"
@@ -119,6 +123,7 @@ class ReCogDriveAgent(AbstractAgent):
             cfg.grpo_cfg.reference_policy_checkpoint = self.reference_policy_checkpoint
             
         self.action_head = ReCogDriveDiffusionPlanner(cfg).cuda()
+        self.action_head.model.set_pointwise_variant(self.dit_pointwise_variant)
         self.num_inference_samples = 1
         self.inference_selection_mode = "median"
 
@@ -237,7 +242,8 @@ class ReCogDriveAgent(AbstractAgent):
             return self.action_head.forward_grpo(last_hidden_state, action_inputs, tokens_list)
         else: 
             action_inputs = BatchFeature({"state": input_state.to(model_dtype), "his_traj": history_trajectory_reshaped.to(model_dtype), "status_feature": status_feature.to(model_dtype)})
-            return self.action_head.get_action(last_hidden_state.to(model_dtype), action_inputs)
+            action_getter = self.action_head.get_action_fast_ddim if self.fast_ddim_action else self.action_head.get_action
+            return action_getter(last_hidden_state.to(model_dtype), action_inputs)
 
     def compute_trajectory(self, agent_input: AgentInput) -> Trajectory:
         self.eval()

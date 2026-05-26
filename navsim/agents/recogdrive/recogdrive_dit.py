@@ -49,6 +49,7 @@ class FinalLayer(nn.Module):
     """
     def __init__(self, hidden_size: int, output_dim: int):
         super().__init__()
+        self.pointwise_variant = "baseline"
         self.norm_final = RMSNorm(hidden_size)
         self.linear = nn.Linear(hidden_size, output_dim)
         self.modulation_proj = nn.Sequential(
@@ -56,15 +57,31 @@ class FinalLayer(nn.Module):
             nn.Linear(hidden_size, 2 * hidden_size )
         )
 
+    def set_pointwise_variant(self, variant: str) -> None:
+        if variant not in {"baseline", "addcmul_residual", "addcmul_pointwise"}:
+            raise ValueError(f"Unsupported pointwise variant: {variant}")
+        self.pointwise_variant = variant
+
     @torch.compile
     def modulate(self, x, shift, scale):
         if shift is None:
             return x * (1 + scale.unsqueeze(1))
         return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
+    @staticmethod
+    def modulate_addcmul(x, shift, scale):
+        scale = scale.unsqueeze(1).add(1.0)
+        if shift is None:
+            return x * scale
+        return torch.addcmul(shift.unsqueeze(1), x, scale)
+
     def forward(self, x: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
         shift, scale = self.modulation_proj(conditioning).chunk(2, dim=1)
-        x = self.modulate(self.norm_final(x), shift, scale)
+        normed = self.norm_final(x)
+        if self.pointwise_variant == "addcmul_pointwise":
+            x = self.modulate_addcmul(normed, shift, scale)
+        else:
+            x = self.modulate(normed, shift, scale)
         x = self.linear(x)
         return x
 
@@ -82,6 +99,7 @@ class LightningDiTBlock(nn.Module):
         norm_eps: float = 1e-5,
     ):
         super().__init__()
+        self.pointwise_variant = "baseline"
 
         if norm_type == "layer_norm":
             self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -112,11 +130,23 @@ class LightningDiTBlock(nn.Module):
                 nn.Linear(dim, 6 * dim, bias=True)
             )
 
+    def set_pointwise_variant(self, variant: str) -> None:
+        if variant not in {"baseline", "addcmul_residual", "addcmul_pointwise"}:
+            raise ValueError(f"Unsupported pointwise variant: {variant}")
+        self.pointwise_variant = variant
+
     @torch.compile
     def modulate(self, x, shift, scale):
         if shift is None:
             return x * (1 + scale.unsqueeze(1))
         return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+    @staticmethod
+    def modulate_addcmul(x, shift, scale):
+        scale = scale.unsqueeze(1).add(1.0)
+        if shift is None:
+            return x * scale
+        return torch.addcmul(shift.unsqueeze(1), x, scale)
 
     def forward(
         self,
@@ -131,7 +161,10 @@ class LightningDiTBlock(nn.Module):
             mod_params.chunk(6, dim=1)
 
         normed_states = self.norm1(hidden_states)
-        modulated_states = self.modulate(normed_states, shift_attn, scale_attn)
+        if self.pointwise_variant == "addcmul_pointwise":
+            modulated_states = self.modulate_addcmul(normed_states, shift_attn, scale_attn)
+        else:
+            modulated_states = self.modulate(normed_states, shift_attn, scale_attn)
 
         attn_output = self.attn(
             modulated_states,
@@ -139,13 +172,22 @@ class LightningDiTBlock(nn.Module):
             rotary_embedder=rotary_embedder,
             encoder_kv=encoder_kv,
         )
-        hidden_states = hidden_states + gate_attn.unsqueeze(1) * attn_output
+        if self.pointwise_variant in {"addcmul_residual", "addcmul_pointwise"}:
+            hidden_states = torch.addcmul(hidden_states, attn_output, gate_attn.unsqueeze(1))
+        else:
+            hidden_states = hidden_states + gate_attn.unsqueeze(1) * attn_output
 
         normed_states = self.norm2(hidden_states)
-        modulated_states = self.modulate(normed_states, shift_ffn, scale_ffn)
+        if self.pointwise_variant == "addcmul_pointwise":
+            modulated_states = self.modulate_addcmul(normed_states, shift_ffn, scale_ffn)
+        else:
+            modulated_states = self.modulate(normed_states, shift_ffn, scale_ffn)
         ffn_output = self.ffn(modulated_states)
 
-        hidden_states = hidden_states + gate_ffn.unsqueeze(1) * ffn_output
+        if self.pointwise_variant in {"addcmul_residual", "addcmul_pointwise"}:
+            hidden_states = torch.addcmul(hidden_states, ffn_output, gate_ffn.unsqueeze(1))
+        else:
+            hidden_states = hidden_states + gate_ffn.unsqueeze(1) * ffn_output
         
         return hidden_states
 
@@ -195,6 +237,13 @@ class LightningDiT(nn.Module):
         self.final_layer = FinalLayer(self.inner_dim, output_dim)
 
         self._initialize_weights()
+
+    def set_pointwise_variant(self, variant: str) -> None:
+        if variant not in {"baseline", "addcmul_residual", "addcmul_pointwise"}:
+            raise ValueError(f"Unsupported pointwise variant: {variant}")
+        for block in self.transformer_blocks:
+            block.set_pointwise_variant(variant)
+        self.final_layer.set_pointwise_variant(variant)
 
     def _initialize_weights(self) -> None:
         """
