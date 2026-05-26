@@ -10,6 +10,7 @@ from navsim.planning.training.abstract_feature_target_builder import AbstractFea
 from navsim.common.dataclasses import Scene, Trajectory
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 from .recogdrive_backbone import RecogDriveBackbone
+from .prompt_utils import build_recogdrive_question
 from .utils.internvl_preprocess import load_image
 
 def format_number(n, decimal_places=2):
@@ -22,7 +23,8 @@ class ReCogDriveFeatureBuilder(AbstractFeatureBuilder):
                  model_type: Optional[str] = None,
                  checkpoint_path: Optional[str] = None,
                  device: str = "cuda",
-                 cache_mode: bool = False, ):
+                 cache_mode: bool = False,
+                 prompt_variant: str = "full", ):
         """
         Initializes the feature builder.
 
@@ -40,6 +42,7 @@ class ReCogDriveFeatureBuilder(AbstractFeatureBuilder):
         self.cache_hidden_state = cache_hidden_state
         self.backbone = None
         self.cache_mode = cache_mode
+        self.prompt_variant = prompt_variant
 
         if self.cache_hidden_state and self.cache_mode:
             if not model_type or not checkpoint_path:
@@ -47,7 +50,8 @@ class ReCogDriveFeatureBuilder(AbstractFeatureBuilder):
             self.backbone = RecogDriveBackbone(
                 model_type=model_type,
                 checkpoint_path=checkpoint_path,
-                device=device
+                device=device,
+                prompt_variant=self.prompt_variant,
             )
 
     def get_unique_name(self) -> str:
@@ -93,13 +97,13 @@ class ReCogDriveFeatureBuilder(AbstractFeatureBuilder):
             num_patches_list = [pv.shape[0] for pv in pixel_values_squeezed]
             pixel_values_cat = torch.cat(list(pixel_values_squeezed), dim=0)
 
-            navigation_commands = ['turn left', 'go straight', 'turn right']
-            command_str = next((navigation_commands[i] for i, v in enumerate(high_command_one_hot) if v == 1), "unknown")
-            history_str = " ".join([f'   - t-{3-i}: ({format_number(history_trajectory[i, 0].item())}, {format_number(history_trajectory[i, 1].item())}, {format_number(history_trajectory[i, 2].item())})' for i in range(4)])
-            
-            prompt = f"<image>\nAs an autonomous driving system, predict the vehicle's trajectory based on:\n1. Visual perception from front camera view\n2. Historical motion context (last 4 timesteps):{history_str}\n3. Active navigation command: [{command_str.upper()}]"
-            output_requirements = "\nOutput requirements:\n- Predict 8 future trajectory points\n- Each point format: (x:float, y:float, heading:float)\n- Use [PT, ...] to encapsulate the trajectory\n- Maintain numerical precision to 2 decimal places"
-            questions = [f"{prompt}{output_requirements}"]
+            questions = [
+                build_recogdrive_question(
+                    history_trajectory,
+                    high_command_one_hot,
+                    prompt_variant=self.prompt_variant,
+                )
+            ]
 
             outputs = self.backbone(pixel_values_cat.cuda(), questions, num_patches_list=num_patches_list)
             last_hidden_state = outputs.hidden_states[-1]

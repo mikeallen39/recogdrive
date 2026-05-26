@@ -25,5 +25,6 @@ image_max_num: 12
 image_backend: 'pil'
 dit_pointwise_variant: 'baseline'
 fast_ddim_action: false
+prompt_variant: 'full'
 grpo: False
 lr: 1e-4

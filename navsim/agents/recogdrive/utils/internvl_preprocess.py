@@ -87,7 +87,13 @@ def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbna
         processed_images.append(thumbnail_img)
     return processed_images
 
-def dynamic_preprocess_parallel(image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
+def dynamic_preprocess_parallel(
+    image,
+    min_num=1,
+    max_num=12,
+    image_size=448,
+    use_thumbnail=False,
+):
     orig_width, orig_height = image.size
     aspect_ratio = orig_width / orig_height
     target_ratios = get_target_ratios(min_num=min_num, max_num=max_num)
@@ -98,7 +104,8 @@ def dynamic_preprocess_parallel(image, min_num=1, max_num=12, image_size=448, us
     target_height = image_size * target_aspect_ratio[1]
     blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    executor = ThreadPoolExecutor(max_workers=2)
+    try:
         resized_future = executor.submit(image.resize, (target_width, target_height))
         thumbnail_future = (
             executor.submit(image.resize, (image_size, image_size))
@@ -107,6 +114,8 @@ def dynamic_preprocess_parallel(image, min_num=1, max_num=12, image_size=448, us
         )
         resized_img = resized_future.result()
         thumbnail_img = thumbnail_future.result() if thumbnail_future is not None else None
+    finally:
+        executor.shutdown(wait=True)
 
     processed_images = []
     for i in range(blocks):
@@ -177,17 +186,32 @@ def load_image(image_file, input_size=448, max_num=12, backend="pil"):
     if backend in {"opencv", "cv2"}:
         return load_image_opencv(image_file, input_size=input_size, max_num=max_num)
 
-    if backend == "pil_draft":
+    draft_backend = backend in {"pil_draft", "pil_draft_parallel_no_resize"}
+    if draft_backend:
         image = Image.open(image_file)
-        image.draft("RGB", (input_size * max_num, input_size * max_num))
+        if backend == "pil_draft_parallel_no_resize":
+            # Decode JPEG at a reduced resolution before the usual PIL resize path.
+            # This is faster but not pixel-equivalent to full-resolution PIL decode.
+            orig_width, orig_height = image.size
+            target_aspect_ratio = find_closest_aspect_ratio(
+                orig_width / orig_height,
+                get_target_ratios(min_num=1, max_num=max_num),
+                orig_width,
+                orig_height,
+                input_size,
+            )
+            draft_size = (input_size * target_aspect_ratio[0], input_size * target_aspect_ratio[1])
+        else:
+            draft_size = (input_size * max_num, input_size * max_num)
+        image.draft("RGB", draft_size)
         image = image.convert('RGB')
     else:
         image = Image.open(image_file).convert('RGB')
 
     numpy_normalize = backend in {"pil_numpy", "pil_parallel_numpy"}
-    no_resize = backend in {"pil_no_resize", "pil_parallel_no_resize"} or numpy_normalize
+    no_resize = backend in {"pil_no_resize", "pil_parallel_no_resize", "pil_draft_parallel_no_resize"} or numpy_normalize
     transform = build_transform(input_size=input_size, resize=not no_resize)
-    if backend in {"pil_parallel", "pil_parallel_no_resize", "pil_parallel_numpy"}:
+    if backend in {"pil_parallel", "pil_parallel_no_resize", "pil_parallel_numpy", "pil_draft_parallel_no_resize"}:
         images = dynamic_preprocess_parallel(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
     elif backend in {"pil", "pil_draft", "pil_no_resize", "pil_numpy"}:
         images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)

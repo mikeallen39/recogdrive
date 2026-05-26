@@ -50,6 +50,8 @@ FlashAttention2 复测环境：
 | 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles | 0.850495 | 167.491 |
 | 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + OpenCV image backend | 0.837151 | 133.029 |
 | 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + OpenCV + addcmul pointwise fusion | 同 OpenCV 行（数值等价） | 129.471 |
+| 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM | 同 PIL 行（数值等价） | 137.370 |
+| 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM + compact prompt v1 | 0.849623 | 131.476 |
 | 2B T-FPS pruning 0.10 | 0.691985 | 265.084 |
 | 2B T-FPS pruning 0.25 | 0.801383 | 295.150 |
 | 2B T-FPS pruning 0.50 | 0.866982 | 352.433 |
@@ -195,6 +197,97 @@ OpenCV 精度结果：
 - `pil_no_resize` 证明 `torchvision.Resize(448,448)` 是冗余开销，去掉后 tensor 与原 PIL 完全一致，图片预处理下降约 `27.3 ms`。
 - `pil_parallel` / `pil_parallel_no_resize` 进一步把图片预处理降到约 `41 ms`，完整 latency 约 `136 ms`，接近 OpenCV 的 `133 ms`，但保持原 PIL tensor 完全等价。
 - 当前最推荐的保精度图片 backend 是 `pil_parallel_no_resize`；相比 OpenCV，它牺牲约 `3 ms` latency，但避免了 OpenCV 额外 `0.013344` PDMS 下降风险。
+
+## Prompt 压缩实验
+
+针对 `2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM`，测试了 `compact_v1` prompt。该版本只压缩 system message 和输出要求，不改历史轨迹格式、不改 high-level command 表达，因此属于低风险 prompt 压缩。
+
+结果文件：
+
+- full prompt latency：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/fusion_fastddim_2b_uniform050_ddim3_maxnum6_pil_parallel_no_resize_50.json`
+- compact prompt latency：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/prompt_compact_v1_2b_uniform050_ddim3_maxnum6_pil_parallel_no_resize_fastddim_50.json`
+- compact prompt PDMS：`/data/zxz/HUAWEI/VLA/navsim_data/exp/recogdrive_agent_eval_2b_uniform050_ddim3_maxnum6_pil_compact_v1_fastddim_zxz/2026.05.26.08.28.21/2026.05.26.09.32.33.csv`
+
+| 配置 | visual tokens | seq len | VLM(ms) | LLM(ms) | diffusion(ms) | e2e GPU(ms) | 完整 latency(ms) | PDMS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| full prompt | 384 | 868.2 | 55.399 | 30.579 | 38.700 | 95.941 | 137.370 | 0.850495 |
+| compact_v1 | 384 | 583.2 | 48.800 | 25.591 | 38.161 | 88.261 | 131.476 | 0.849623 |
+
+结论：
+
+- `compact_v1` 将非视觉 token 从约 `486` 降到约 `201`，主要收益来自 system prompt token 从约 `283` 降到约 `31`。
+- VLM latency 下降 `6.599 ms`，其中 LLM 下降 `4.988 ms`；完整同步 latency 下降 `5.894 ms`。
+- navtest `12146/12146` 成功、`0` failed，PDMS 为 `0.849623`，相比 full prompt 对应 PIL 配置 `0.850495` 下降 `0.000872`，目前可以认为精度基本保持。
+
+## JPEG Decode 与 Draft 解码
+
+当前 NAVSIM navtest 的前视相机图像来自磁盘上的 `.jpg` 文件，模型实际输入不是 JPEG 字节流，而是解码后的 RGB tensor。当前 PIL 路径的主要流程是：
+
+```text
+JPEG 文件
+-> Image.open() 读取 header / 元信息
+-> convert("RGB") 触发 JPEG decode 和 RGB 转换
+-> dynamic_preprocess 做动态 tile resize、crop 和 thumbnail resize
+-> ToTensor + Normalize
+-> torch.cat 后 H2D 到 GPU
+```
+
+注意：`Image.open()` 本身通常是 lazy load，真正 JPEG decode 往往发生在 `convert("RGB")`、`resize()` 或第一次访问像素时。因此 profiling 里应把 `open / decode+convert / resize` 作为耦合的 CPU 图片预处理路径看待。
+
+针对 `2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM + compact prompt v1`，进一步拆分 CPU 图片预处理，主要耗时如下：
+
+| 阶段 | mean(ms) | 说明 |
+|---|---:|---|
+| open + JPEG decode + RGB convert | 10.794 | PIL lazy load 后在访问像素时完成解码 |
+| grid resize | 22.351 | 原图 resize 到动态 tile 网格大小 |
+| thumbnail resize | 17.231 | 额外生成 `448x448` thumbnail |
+| crop | 0.352 | 从 grid resize 结果裁 tile |
+| ToTensor + Normalize + stack | 3.565 | 转 tensor 与 ImageNet normalize |
+| total | 54.315 | micro-profile 单独测得，和完整 latency 脚本存在样本/系统噪声差异 |
+
+`pil_draft_parallel_no_resize` 的思路是使用 `PIL.Image.draft()` 给 JPEG decoder 一个低分辨率解码提示。普通路径近似为：
+
+```text
+1920x1080 JPEG -> 全分辨率 RGB -> resize 到 1344x448 / 448x448
+```
+
+draft 路径近似为：
+
+```text
+1920x1080 JPEG -> decode 时降采样到约 960x540 RGB -> resize 到 1344x448 / 448x448
+```
+
+它快的原因是 JPEG 解码阶段少处理像素，后续 resize 的输入也更小。但它不是无损工程优化，因为 resize 的源图已经变了，高频细节和插值结果都会改变。
+
+Latency 结果：
+
+| backend | 图片预处理 CPU(ms) | e2e GPU(ms) | 完整 latency(ms) | 与原 PIL tensor 等价 |
+|---|---:|---:|---:|---|
+| pil_parallel_no_resize + compact_v1 | 43.013 | 88.261 | 131.476 | 是 |
+| pil_parallel_numpy + compact_v1 | 47.483 | 88.670 | 136.375 | 是 |
+| pil_draft_parallel_no_resize + compact_v1 | 25.336 | 91.710 | 117.305 | 否 |
+
+Tensor 差异：
+
+| backend | max abs diff | mean abs diff |
+|---|---:|---:|
+| pil_parallel_no_resize | 0.000000 | 0.000000 |
+| pil_parallel_numpy | 0.000000 | 0.000000 |
+| pil_draft_parallel_no_resize | 0.736364 | 0.009364 |
+
+结论：
+
+- `pil_parallel_numpy` 虽然 tensor 等价，但实际比 `pil_parallel_no_resize` 慢，不推荐。
+- 复用全局 resize 线程池的尝试也比每次创建局部线程池更慢，已回退。
+- `pil_draft_parallel_no_resize` 将图片预处理从 `43.013 ms` 降到 `25.336 ms`，完整 latency 从 `131.476 ms` 降到 `117.305 ms`，是目前 CPU 侧收益最大的尝试。
+- 但 draft 解码不是像素等价，输入 tensor 平均差异约 `0.00936`，必须跑 navtest PDMS 后才能判断是否可用；它应视为“速度换输入图像质量”的近似加速，而不是保精度优化。
+
+真实车端部署注意：
+
+- 自动驾驶在线链路里相机通常不会给 JPEG 文件，更常见的是 ISP 后的 `YUV/NV12/NV21/YUYV` 或某些链路中的 RGB/BGR buffer；Raw Bayer/RCCB 通常还要经过 ISP。
+- JPEG/H.264/H.265/MJPEG 更多用于记录、回传或离线数据集存储，不一定是实时感知主链路输入。
+- 因此 NAVSIM 上的 `JPEG decode + PIL resize` 主要是离线数据集复现成本，不完全等价于车端在线部署成本。
+- 面向 910B / 昇腾部署时，更合理的方向是设计 `YUV/NV12 -> resize/crop/color convert/normalize -> NPU tensor` 的 DVPP/AIPP 前处理路径，而不是继续深挖 PIL/JPEG。
 
 ## FA2 下的 2B vs 8B
 

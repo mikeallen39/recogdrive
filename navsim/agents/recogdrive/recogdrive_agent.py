@@ -15,9 +15,10 @@ from nuplan.planning.simulation.trajectory.trajectory_sampling import Trajectory
 
 from .utils.internvl_preprocess import load_image
 from .utils.lr_scheduler import WarmupCosLR
-from .utils.utils import format_number, build_from_configs
+from .utils.utils import build_from_configs
 from .recogdrive_features import ReCogDriveFeatureBuilder ,TrajectoryTargetBuilder
 from .recogdrive_backbone import RecogDriveBackbone
+from .prompt_utils import build_recogdrive_question
 from .recogdrive_diffusion_planner import (
     ReCogDriveDiffusionPlanner,
     ReCogDriveDiffusionPlannerConfig,
@@ -49,6 +50,7 @@ class ReCogDriveAgent(AbstractAgent):
         image_backend: str = "pil",
         dit_pointwise_variant: str = "baseline",
         fast_ddim_action: bool = False,
+        prompt_variant: str = "full",
     ):
         super().__init__()
         self._trajectory_sampling = trajectory_sampling
@@ -72,6 +74,7 @@ class ReCogDriveAgent(AbstractAgent):
         self.image_backend = image_backend
         self.dit_pointwise_variant = dit_pointwise_variant
         self.fast_ddim_action = fast_ddim_action
+        self.prompt_variant = prompt_variant
 
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
         device = f"cuda:{local_rank}"
@@ -86,6 +89,7 @@ class ReCogDriveAgent(AbstractAgent):
                 device=device,
                 prune_keep_ratio=self.vlm_prune_keep_ratio,
                 prune_method=self.vlm_prune_method,
+                prompt_variant=self.prompt_variant,
             )
 
             if not self.train_backbone:
@@ -154,6 +158,7 @@ class ReCogDriveAgent(AbstractAgent):
             checkpoint_path=self.vlm_path,
             device=self.device,
             cache_mode=self.cache_mode,
+            prompt_variant=self.prompt_variant,
         )]
 
     def forward(self, features: Dict[str, torch.Tensor], targets=None, tokens_list=None) -> Dict[str, torch.Tensor]:
@@ -190,36 +195,16 @@ class ReCogDriveAgent(AbstractAgent):
             pixel_values_cat = torch.cat(pixel_values_list, dim=0).cuda()
             
 
-            navigation_commands = ['turn left', 'go straight', 'turn right']
-            command_indices = torch.argmax(high_command_one_hot, dim=-1)
-            command_str_list = [navigation_commands[idx.item()] for idx in command_indices]
-
             questions = []
             batch_size = high_command_one_hot.shape[0]
             for i in range(batch_size):
-                history_trajectory_sample = history_trajectory[i]
-                command_str_sample = command_str_list[i]
-
-                history_str = ' '.join([
-                    f'   - t-{3-j}: ({format_number(history_trajectory_sample[j, 0].item())}, '
-                    f'{format_number(history_trajectory_sample[j, 1].item())}, '
-                    f'{format_number(history_trajectory_sample[j, 2].item())})'
-                    for j in range(history_trajectory_sample.shape[0])
-                ])
-                
-                prompt = (
-                    "<image>\nAs an autonomous driving system, predict the vehicle's trajectory based on:\n"
-                    "1. Visual perception from front camera view\n"
-                    f"2. Historical motion context (last 4 timesteps):{history_str}\n"
-                    f"3. Active navigation command: [{command_str_sample.upper()}]"
+                questions.append(
+                    build_recogdrive_question(
+                        history_trajectory[i],
+                        high_command_one_hot[i],
+                        prompt_variant=self.prompt_variant,
+                    )
                 )
-                output_requirements = (
-                    "\nOutput requirements:\n- Predict 8 future trajectory points\n"
-                    "- Each point format: (x:float, y:float, heading:float)\n"
-                    "- Use [PT, ...] to encapsulate the trajectory\n"
-                    "- Maintain numerical precision to 2 decimal places"
-                )
-                questions.append(f"{prompt}{output_requirements}")
 
             outputs = self.backbone(pixel_values_cat, questions, num_patches_list=num_patches_list)
             last_hidden_state = outputs.hidden_states[-1]

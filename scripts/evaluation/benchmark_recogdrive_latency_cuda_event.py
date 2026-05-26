@@ -18,9 +18,12 @@ from navsim.agents.recogdrive.recogdrive_backbone import (
     IMG_CONTEXT_TOKEN,
     IMG_END_TOKEN,
     IMG_START_TOKEN,
-    system_message,
 )
-from navsim.agents.recogdrive.recogdrive_features import format_number
+from navsim.agents.recogdrive.prompt_utils import (
+    PROMPT_VARIANTS,
+    build_recogdrive_question,
+    get_system_message,
+)
 from navsim.agents.recogdrive.utils.conversation import get_conv_template
 from navsim.agents.recogdrive.utils.internvl_preprocess import load_image
 from navsim.agents.recogdrive.blocks.rope import rotate_half
@@ -193,31 +196,12 @@ def cast_action_head_dtype(action_head, dtype_name):
     action_head.to(dtype=ACTION_HEAD_DTYPES[dtype_name])
 
 
-def build_question(history_trajectory, high_command_one_hot):
-    navigation_commands = ["turn left", "go straight", "turn right"]
-    command_idx = torch.argmax(high_command_one_hot, dim=-1).item()
-    command_str = navigation_commands[command_idx]
-    history_str = " ".join(
-        [
-            f"   - t-{3-j}: ({format_number(history_trajectory[j, 0].item())}, "
-            f"{format_number(history_trajectory[j, 1].item())}, "
-            f"{format_number(history_trajectory[j, 2].item())})"
-            for j in range(history_trajectory.shape[0])
-        ]
+def build_question(history_trajectory, high_command_one_hot, prompt_variant="full"):
+    return build_recogdrive_question(
+        history_trajectory,
+        high_command_one_hot,
+        prompt_variant=prompt_variant,
     )
-    prompt = (
-        "<image>\nAs an autonomous driving system, predict the vehicle's trajectory based on:\n"
-        "1. Visual perception from front camera view\n"
-        f"2. Historical motion context (last 4 timesteps):{history_str}\n"
-        f"3. Active navigation command: [{command_str.upper()}]"
-    )
-    output_requirements = (
-        "\nOutput requirements:\n- Predict 8 future trajectory points\n"
-        "- Each point format: (x:float, y:float, heading:float)\n"
-        "- Use [PT, ...] to encapsulate the trajectory\n"
-        "- Maintain numerical precision to 2 decimal places"
-    )
-    return f"{prompt}{output_requirements}"
 
 
 def make_agent_input_features(agent, agent_input):
@@ -235,7 +219,7 @@ def build_profiled_backbone_inputs(backbone, pixel_values, questions, num_patche
             question = "<image>\n" + question
 
         template = get_conv_template("internvl2_5")
-        template.system_message = system_message
+        template.system_message = get_system_message(getattr(backbone, "prompt_variant", "full"))
         template.append_message(template.roles[0], question)
         template.append_message(template.roles[1], None)
         query = template.get_prompt()
@@ -343,7 +327,13 @@ def run_one(agent, agent_input, image_max_num, image_backend, action_getter=None
     num_patches_list = [pixel_values.shape[0] for pixel_values in pixel_values_list]
 
     h2d_ms, pixel_values_cat = cuda_time_ms(lambda: torch.cat(pixel_values_list, dim=0).cuda())
-    questions = [build_question(history_trajectory[0], high_command_one_hot[0])]
+    questions = [
+        build_question(
+            history_trajectory[0],
+            high_command_one_hot[0],
+            prompt_variant=getattr(agent.backbone, "prompt_variant", "full"),
+        )
+    ]
 
     vlm_ms, outputs = cuda_time_ms(
         lambda: agent.backbone(pixel_values_cat, questions, num_patches_list=num_patches_list)
@@ -426,6 +416,7 @@ def main():
             "pil_parallel",
             "pil_no_resize",
             "pil_parallel_no_resize",
+            "pil_draft_parallel_no_resize",
             "pil_numpy",
             "pil_parallel_numpy",
             "opencv",
@@ -434,6 +425,7 @@ def main():
     parser.add_argument("--compile-action-head", action="store_true")
     parser.add_argument("--compile-mode", type=str, default="reduce-overhead")
     parser.add_argument("--fast-ddim-action", action="store_true")
+    parser.add_argument("--prompt-variant", type=str, default="full", choices=sorted(PROMPT_VARIANTS))
     parser.add_argument(
         "--dit-pointwise-variant",
         type=str,
@@ -490,6 +482,7 @@ def main():
                 f"agent.vlm_prune_keep_ratio={args.prune_keep_ratio}",
                 f"agent.vlm_prune_method={args.prune_method}",
                 f"agent.diffusion_num_inference_steps={args.diffusion_steps}",
+                f"agent.prompt_variant={args.prompt_variant}",
             ],
         )
 
@@ -586,6 +579,7 @@ def main():
         "compile_action_head": args.compile_action_head,
         "compile_mode": args.compile_mode if args.compile_action_head else None,
         "fast_ddim_action": args.fast_ddim_action,
+        "prompt_variant": args.prompt_variant,
         "metrics": {key: summarize(record[key] for record in measured) for key in metric_keys},
         "num_patches": summarize(record["num_patches"] for record in measured),
         "num_visual_tokens": summarize(record["num_visual_tokens"] for record in measured),

@@ -6,22 +6,13 @@ from transformers import AutoModel, AutoTokenizer
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .utils.conversation import get_conv_template
+from .prompt_utils import FULL_SYSTEM_MESSAGE, get_system_message
 
 IMG_CONTEXT_TOKEN = '<IMG_CONTEXT>'
 IMG_START_TOKEN = '<img>'
 IMG_END_TOKEN = '</img>'
 
-system_message = """
-You are a vehicle trajectory prediction model for autonomous driving. Your task is to predict the ego vehicle's 4-second trajectory based on the following inputs: multi-view images from 8 cameras, ego vehicle states (position), and discrete navigation commands. The input provides a 2-second history, and your output should ensure a safe trajectory for the next 4 seconds. Your predictions must adhere to the following metrics:
-1. **No at-fault Collisions (NC)**: Avoid collisions with other objects/vehicles.
-2. **Drivable Area Compliance (DAC)**: Stay within the drivable area.
-3. **Time to Collision (TTC)**: Maintain a safe distance from other vehicles.
-4. **Ego Progress (EP)**: Ensure the ego vehicle moves forward without being stuck.
-5. **Comfort (C)**: Avoid sharp turns and sudden decelerations.
-6. **Driving Direction Compliance (DDC)**: Align with the intended driving direction.
-For evaluation, use the **PDM Score**, which combines these metrics: **PDM Score** = NC * DAC * (5*TTC + 5*EP + 2*C + 0*DDC) / 12.
-Your predictions will be evaluated through a non-reactive 4-second simulation with an LQR controller and background actors following their recorded trajectories. The better your predictions, the higher your score.
-"""
+system_message = FULL_SYSTEM_MESSAGE
 
 class RecogDriveBackbone(nn.Module):
     """
@@ -33,7 +24,8 @@ class RecogDriveBackbone(nn.Module):
                  checkpoint_path: str,
                  device: str = "cuda",
                  prune_keep_ratio: float = 1.0,
-                 prune_method: str = "tfps"):
+                 prune_method: str = "tfps",
+                 prompt_variant: str = "full"):
         """
         Initializes and loads the specified model and its preprocessor/tokenizer.
 
@@ -50,6 +42,7 @@ class RecogDriveBackbone(nn.Module):
         self.device = device
         self.prune_keep_ratio = float(prune_keep_ratio)
         self.prune_method = prune_method.lower()
+        self.prompt_variant = prompt_variant
         self.last_input_seq_len = None
 
         print(f"Initializing backbone of type: '{self.model_type}' from path: '{checkpoint_path}'")
@@ -208,7 +201,7 @@ class RecogDriveBackbone(nn.Module):
 
     def _configure_internvl(self):
         """Applies specific configurations required for the InternVL model."""
-        self.model.system_message = system_message
+        self.model.system_message = get_system_message(self.prompt_variant)
         self.img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         self.model.img_context_token_id = self.img_context_token_id
         print("InternVL model configured.")
@@ -226,7 +219,7 @@ class RecogDriveBackbone(nn.Module):
                 question = '<image>\n' + question
             
             template = get_conv_template("internvl2_5")
-            template.system_message = system_message
+            template.system_message = get_system_message(self.prompt_variant)
             template.append_message(template.roles[0], question)
             template.append_message(template.roles[1], None)
             query = template.get_prompt()
