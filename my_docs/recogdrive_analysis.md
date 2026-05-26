@@ -52,6 +52,7 @@ FlashAttention2 复测环境：
 | 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + OpenCV + addcmul pointwise fusion | 同 OpenCV 行（数值等价） | 129.471 |
 | 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM | 同 PIL 行（数值等价） | 137.370 |
 | 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM + compact prompt v1 | 0.849623 | 131.476 |
+| 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM + compact prompt v1 + LLM W8A8 fake quant | 0.849867 | 未测 |
 | 2B T-FPS pruning 0.10 | 0.691985 | 265.084 |
 | 2B T-FPS pruning 0.25 | 0.801383 | 295.150 |
 | 2B T-FPS pruning 0.50 | 0.866982 | 352.433 |
@@ -218,6 +219,26 @@ OpenCV 精度结果：
 - `compact_v1` 将非视觉 token 从约 `486` 降到约 `201`，主要收益来自 system prompt token 从约 `283` 降到约 `31`。
 - VLM latency 下降 `6.599 ms`，其中 LLM 下降 `4.988 ms`；完整同步 latency 下降 `5.894 ms`。
 - navtest `12146/12146` 成功、`0` failed，PDMS 为 `0.849623`，相比 full prompt 对应 PIL 配置 `0.850495` 下降 `0.000872`，目前可以认为精度基本保持。
+
+## LLM W8A8 伪量化实验
+
+针对 `2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM + compact prompt v1`，进一步只对 VLM 中的 LLM Linear 做 W8A8 fake quant。该实现用于验证量化敏感性：权重做 per-output-channel fake quant 并缓存，激活做 per-token dynamic fake quant；matmul 仍然是 BF16/FP16 `F.linear`，不代表真实 int8 kernel 的 latency。
+
+结果文件：
+
+- W8A8 fake quant PDMS：`/data/zxz/HUAWEI/VLA/navsim_data/exp/recogdrive_agent_eval_2b_uniform050_ddim3_maxnum6_pil_compact_v1_fastddim_w8a8_fake_llm_zxz/2026.05.26.11.58.24/2026.05.26.13.04.03.csv`
+- 运行日志：`/data/zxz/HUAWEI/VLA/navsim_data/exp/logs/pdms_w8a8_fake_llm_gpu4_20260526_115813.log`
+
+| 配置 | LLM Linear 数 | 成功场景 | failed | PDMS |
+|---|---:|---:|---:|---:|
+| compact_v1 baseline | - | 12146 | 0 | 0.849623 |
+| compact_v1 + LLM W8A8 fake quant | 196 | 12146 | 0 | 0.849867 |
+
+结论：
+
+- LLM-only W8A8 fake quant 没有造成可观测精度下降；相对 compact_v1 baseline，PDMS 变化为 `+0.000244`，属于评估噪声量级。
+- 当前 fake quant 不是加速实现。完整 PDMS 平均单场景耗时从约 `0.314 s/scene` 到约 `0.345 s/scene` 的量级，主要因为每个 Linear 前增加了动态激活量化的 `abs/amax/round/clamp/dequant`。
+- 如果后续做真加速，需要接真实 W8A8 GEMM / 910B CANN 量化图；该实验只说明 LLM Linear 的 W8A8 数值扰动风险较低。
 
 ## JPEG Decode 与 Draft 解码
 
@@ -610,6 +631,83 @@ SDPA backend ablation：
 - `math` 明显更慢，不应作为部署路径。
 - `flash` 和 `cudnn` 失败原因是 diffusion planner 当前 attention 的 Q/K/V 为 `float32`，PyTorch flash/cudnn SDPA 要求 Q/K/V 为 `float16` 或 `bfloat16`。
 - 这说明单纯切 SDPA backend 没有明显额外空间；如果要继续挖 attention，需要考虑把 action head 的 attention 子路径安全降到 fp16/bf16 或针对 910B 做静态图融合，而不是强制 PyTorch backend。
+
+### Diffusion Attention 内部拆分
+
+为了确认 block-level profiling 中 `attention=9.259 ms` 的组成，进一步在 `Attention.forward()` 内部用 CUDA event 拆分：
+
+- no fast-DDIM：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_diffusion_attention_internal_uniform050_ddim3_maxnum6_opencv_10.json`
+- fast-DDIM：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_diffusion_attention_internal_fastddim_uniform050_ddim3_maxnum6_opencv_10.json`
+
+测试配置：`2B + uniform@0.50 + DDIM3 + image max_num 6 / 3 tiles + OpenCV`。注意：attention 内部插入大量 CUDA event 会显著改变绝对耗时，因此下面主要看相对占比和调用数变化，不直接替代原始 latency。
+
+no fast-DDIM 下，`attention` 是完整 attention module 调用，包含 `to_q/to_k/to_v`、`q_norm/k_norm`、RoPE、SDPA、`to_out` 和 reshape。按内部 component sum 的占比估算，映射到原 block-level `attention=9.259 ms` 后大致为：
+
+| 部分 | 约等效耗时(ms) | 占比 |
+|---|---:|---:|
+| k_norm | 1.457 | 15.7% |
+| SDPA | 1.442 | 15.6% |
+| q_norm | 1.193 | 12.9% |
+| RoPE q | 1.090 | 11.8% |
+| to_q linear | 0.867 | 9.4% |
+| to_k linear | 0.719 | 7.8% |
+| to_v linear | 0.676 | 7.3% |
+| to_out linear | 0.640 | 6.9% |
+| RoPE cache/slice | 0.577 | 6.2% |
+| RoPE k | 0.453 | 4.9% |
+| reshape | 0.144 | 1.6% |
+
+合并类别：
+
+| 类别 | 占比 |
+|---|---:|
+| Q/K/V/out linear | 31.3% |
+| Q/K norm | 28.6% |
+| RoPE 相关 | 22.9% |
+| SDPA 核心 attention | 15.6% |
+| reshape | 1.6% |
+
+开启 fast-DDIM 后，cross-attention 的 K/V 会提前通过 `build_cross_attention_kv_cache()` 缓存，DDIM 采样过程中不再重复计算 cross-attention 的 `to_k/to_v/k_norm`。调用数变化如下：
+
+| 部分 | no fast-DDIM calls | fast-DDIM calls |
+|---|---:|---:|
+| to_q | 480 | 480 |
+| to_k | 480 | 240 |
+| to_v | 480 | 240 |
+| q_norm | 480 | 480 |
+| k_norm | 480 | 240 |
+| SDPA | 480 | 480 |
+| to_out | 480 | 480 |
+
+fast-DDIM 下 attention 内部 component sum 占比变为：
+
+| 部分 | 占比 |
+|---|---:|
+| SDPA | 19.0% |
+| q_norm | 16.4% |
+| RoPE q | 13.9% |
+| to_q linear | 11.0% |
+| k_norm | 9.2% |
+| to_out linear | 7.9% |
+| RoPE cache/slice | 7.3% |
+| RoPE k | 5.7% |
+| to_k linear | 4.0% |
+| to_v linear | 3.8% |
+| reshape | 1.9% |
+
+fast-DDIM 的收益与代价：
+
+- 收益：消除 cross-attention K/V projection 和 K norm 在每个 denoise step 内的重复计算；内部 profiling 中 attention component sum / DiT forward 从 `10.11 ms` 降到 `8.62 ms`，profiled total 从 `74.37 ms` 降到 `70.13 ms`。
+- 精度代价：当前实现只缓存 DDIM steps 内不变的 `vl_features` 对应 K/V，等价性测试中输出差异为浮点重排量级，因此理论上不应带来独立 PDMS 风险。
+- 显存代价：需要额外保存 cross-attention K/V cache，但当前 2B small diffusion 下这部分远小于 VLM 显存，不是主要瓶颈。
+- 适用边界：只适合推理；如果后续模型让条件特征随 denoise step 变化，或者训练需要梯度，不应默认复用该 cache。
+- 工程代价：多了一条 `forward_with_kv_cache` 路径，需要持续保证与原始 attention 路径数值一致。
+
+结论：
+
+- fast-DDIM 已经把 cross-attention K/V 重复计算这块优化掉，后续继续挖 attention 时，不应再把 K/V cache 当主要方向。
+- 当前 attention 内部不是 SDPA 单点瓶颈；`q/k norm`、RoPE、Q/out linear 和 SDPA 都有明显占比。
+- 面向 910B，attention 优化更合理的方向是固定 shape 子图、融合 q/k norm 与 RoPE、减少 pointwise/reshape/launch，而不是只替换 SDPA backend。
 
 ## 2B-RL + 视觉 Token Pruning Navtest 精度
 

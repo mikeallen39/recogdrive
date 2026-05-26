@@ -7,6 +7,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .utils.conversation import get_conv_template
 from .prompt_utils import FULL_SYSTEM_MESSAGE, get_system_message
+from .llm_quantization import apply_llm_w8a8_fake_quant
 
 IMG_CONTEXT_TOKEN = '<IMG_CONTEXT>'
 IMG_START_TOKEN = '<img>'
@@ -25,7 +26,8 @@ class RecogDriveBackbone(nn.Module):
                  device: str = "cuda",
                  prune_keep_ratio: float = 1.0,
                  prune_method: str = "tfps",
-                 prompt_variant: str = "full"):
+                 prompt_variant: str = "full",
+                 llm_quant_mode: str = "none"):
         """
         Initializes and loads the specified model and its preprocessor/tokenizer.
 
@@ -43,6 +45,7 @@ class RecogDriveBackbone(nn.Module):
         self.prune_keep_ratio = float(prune_keep_ratio)
         self.prune_method = prune_method.lower()
         self.prompt_variant = prompt_variant
+        self.llm_quant_mode = llm_quant_mode.lower()
         self.last_input_seq_len = None
 
         print(f"Initializing backbone of type: '{self.model_type}' from path: '{checkpoint_path}'")
@@ -64,6 +67,7 @@ class RecogDriveBackbone(nn.Module):
             )
             # Load model-specific configuration
             self._configure_internvl()
+            self._configure_llm_quantization()
             self.num_image_token = 256
             self.pruned_num_image_token = self._get_pruned_num_image_token(self.num_image_token)
 
@@ -84,6 +88,17 @@ class RecogDriveBackbone(nn.Module):
 
 
         print(f"Backbone '{self.model_type}' loaded successfully on device '{self.device}'.")
+
+    def _configure_llm_quantization(self):
+        if self.llm_quant_mode in {"none", "fp16", "bf16", ""}:
+            return
+        if self.llm_quant_mode != "w8a8_fake":
+            raise ValueError(f"Unsupported llm_quant_mode: {self.llm_quant_mode}")
+        summary = apply_llm_w8a8_fake_quant(self.model.language_model)
+        print(
+            f"Applied LLM quantization mode '{summary.mode}' "
+            f"to {summary.replaced_linears} Linear layers."
+        )
 
     def _get_pruned_num_image_token(self, num_image_token: int) -> int:
         if self.prune_keep_ratio >= 1.0:
