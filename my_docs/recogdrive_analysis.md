@@ -53,6 +53,7 @@ FlashAttention2 复测环境：
 | 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM | 同 PIL 行（数值等价） | 137.370 |
 | 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM + compact prompt v1 | 0.849623 | 131.476 |
 | 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM + compact prompt v1 + LLM W8A8 fake quant | 0.849867 | 未测 |
+| 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM + compact prompt v1 + LLM + vision encoder W8A8 fake quant | 0.849118 | 未测 |
 | 2B T-FPS pruning 0.10 | 0.691985 | 265.084 |
 | 2B T-FPS pruning 0.25 | 0.801383 | 295.150 |
 | 2B T-FPS pruning 0.50 | 0.866982 | 352.433 |
@@ -220,25 +221,29 @@ OpenCV 精度结果：
 - VLM latency 下降 `6.599 ms`，其中 LLM 下降 `4.988 ms`；完整同步 latency 下降 `5.894 ms`。
 - navtest `12146/12146` 成功、`0` failed，PDMS 为 `0.849623`，相比 full prompt 对应 PIL 配置 `0.850495` 下降 `0.000872`，目前可以认为精度基本保持。
 
-## LLM W8A8 伪量化实验
+## VLM W8A8 伪量化实验
 
-针对 `2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM + compact prompt v1`，进一步只对 VLM 中的 LLM Linear 做 W8A8 fake quant。该实现用于验证量化敏感性：权重做 per-output-channel fake quant 并缓存，激活做 per-token dynamic fake quant；matmul 仍然是 BF16/FP16 `F.linear`，不代表真实 int8 kernel 的 latency。
+针对 `2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM + compact prompt v1`，进一步做 VLM 内部 W8A8 fake quant。该实现用于验证量化敏感性：权重做 per-output-channel fake quant 并缓存，激活做 dynamic fake quant；matmul / conv 仍然是 BF16/FP16 `F.linear` / `F.conv2d`，不代表真实 int8 kernel 的 latency。
 
 结果文件：
 
-- W8A8 fake quant PDMS：`/data/zxz/HUAWEI/VLA/navsim_data/exp/recogdrive_agent_eval_2b_uniform050_ddim3_maxnum6_pil_compact_v1_fastddim_w8a8_fake_llm_zxz/2026.05.26.11.58.24/2026.05.26.13.04.03.csv`
-- 运行日志：`/data/zxz/HUAWEI/VLA/navsim_data/exp/logs/pdms_w8a8_fake_llm_gpu4_20260526_115813.log`
+- LLM-only W8A8 fake quant PDMS：`/data/zxz/HUAWEI/VLA/navsim_data/exp/recogdrive_agent_eval_2b_uniform050_ddim3_maxnum6_pil_compact_v1_fastddim_w8a8_fake_llm_zxz/2026.05.26.11.58.24/2026.05.26.13.04.03.csv`
+- LLM-only 运行日志：`/data/zxz/HUAWEI/VLA/navsim_data/exp/logs/pdms_w8a8_fake_llm_gpu4_20260526_115813.log`
+- LLM + vision encoder W8A8 fake quant PDMS：`/data/zxz/HUAWEI/VLA/navsim_data/exp/recogdrive_agent_eval_2b_uniform050_ddim3_maxnum6_pil_compact_v1_fastddim_w8a8_fake_llm_vision_zxz/2026.05.26.13.34.00/2026.05.26.14.43.21.csv`
+- LLM + vision encoder 运行日志：`/data/zxz/HUAWEI/VLA/navsim_data/exp/logs/pdms_w8a8_fake_llm_vision_gpu7_20260526_133349.log`
 
-| 配置 | LLM Linear 数 | 成功场景 | failed | PDMS |
-|---|---:|---:|---:|---:|
-| compact_v1 baseline | - | 12146 | 0 | 0.849623 |
-| compact_v1 + LLM W8A8 fake quant | 196 | 12146 | 0 | 0.849867 |
+| 配置 | LLM Linear 数 | vision Linear 数 | vision Conv2d 数 | 成功场景 | failed | PDMS |
+|---|---:|---:|---:|---:|---:|---:|
+| compact_v1 baseline | - | - | - | 12146 | 0 | 0.849623 |
+| compact_v1 + LLM W8A8 fake quant | 196 | - | - | 12146 | 0 | 0.849867 |
+| compact_v1 + LLM + vision encoder W8A8 fake quant | 196 | 96 | 1 | 12146 | 0 | 0.849118 |
 
 结论：
 
 - LLM-only W8A8 fake quant 没有造成可观测精度下降；相对 compact_v1 baseline，PDMS 变化为 `+0.000244`，属于评估噪声量级。
+- 在 LLM-only 基础上叠加 vision encoder W8A8 fake quant 后，PDMS 为 `0.849118`；相对 compact_v1 baseline 下降 `0.000504`，相对 LLM-only 下降 `0.000748`，仍属于很小的波动。
 - 当前 fake quant 不是加速实现。完整 PDMS 平均单场景耗时从约 `0.314 s/scene` 到约 `0.345 s/scene` 的量级，主要因为每个 Linear 前增加了动态激活量化的 `abs/amax/round/clamp/dequant`。
-- 如果后续做真加速，需要接真实 W8A8 GEMM / 910B CANN 量化图；该实验只说明 LLM Linear 的 W8A8 数值扰动风险较低。
+- 如果后续做真加速，需要接真实 W8A8 GEMM / Conv / 910B CANN 量化图；该实验说明 LLM Linear 与 vision encoder Linear/patch embedding Conv2d 的 W8A8 数值扰动风险都较低。
 
 ## JPEG Decode 与 Draft 解码
 

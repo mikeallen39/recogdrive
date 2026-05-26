@@ -52,6 +52,7 @@ class ReCogDriveAgent(AbstractAgent):
         fast_ddim_action: bool = False,
         prompt_variant: str = "full",
         vlm_llm_quant_mode: str = "none",
+        vlm_vision_quant_mode: str = "none",
     ):
         super().__init__()
         self._trajectory_sampling = trajectory_sampling
@@ -77,6 +78,7 @@ class ReCogDriveAgent(AbstractAgent):
         self.fast_ddim_action = fast_ddim_action
         self.prompt_variant = prompt_variant
         self.vlm_llm_quant_mode = vlm_llm_quant_mode
+        self.vlm_vision_quant_mode = vlm_vision_quant_mode
 
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
         device = f"cuda:{local_rank}"
@@ -93,6 +95,7 @@ class ReCogDriveAgent(AbstractAgent):
                 prune_method=self.vlm_prune_method,
                 prompt_variant=self.prompt_variant,
                 llm_quant_mode=self.vlm_llm_quant_mode,
+                vision_quant_mode=self.vlm_vision_quant_mode,
             )
 
             if not self.train_backbone:

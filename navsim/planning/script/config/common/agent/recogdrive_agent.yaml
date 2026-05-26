@@ -27,5 +27,6 @@ dit_pointwise_variant: 'baseline'
 fast_ddim_action: false
 prompt_variant: 'full'
 vlm_llm_quant_mode: 'none'
+vlm_vision_quant_mode: 'none'
 grpo: False
 lr: 1e-4
