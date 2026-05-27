@@ -1,6 +1,6 @@
 # W8A8 SGL Kernel Latency 对比记录
 
-本文档记录 RecogDrive 2B 在当前优化配置下，BF16 baseline 与 W8A8 `sgl_kernel.int8_scaled_mm` 真量化路径的端到端 latency 对比。`torch._int_mm` 结果不作为有效对比对象，因为该路径没有使用 fused scaled int8 GEMM，前后处理开销过大，不能代表可用的 W8A8 实现。
+本文档记录 RecogDrive 2B 在当前优化配置下，BF16 baseline 与 W8A8 `sgl_kernel.int8_scaled_mm` 真量化路径的端到端 latency 对比。
 
 ## 测试配置
 
@@ -37,7 +37,8 @@ W8A8 SGL kernel 结果文件：
 |---|---:|---:|---:|---:|---:|
 | BF16 baseline | 88.261 ms | 48.800 ms | 17.070 ms | 25.591 ms | 38.161 ms |
 | W8A8 SGL kernel | 130.174 ms | 89.001 ms | 32.227 ms | 48.319 ms | 39.961 ms |
-| W8A8 - BF16 | +41.913 ms | +40.201 ms | +15.157 ms | +22.728 ms | +1.800 ms |
+| W8A8 SGL kernel + fused activation quant | 91.465 ms | 52.124 ms | 16.420 ms | 29.148 ms | 38.174 ms |
+| W8A8 fused quant - BF16 | +3.204 ms | +3.324 ms | -0.650 ms | +3.557 ms | +0.013 ms |
 
 结论：
 
@@ -45,6 +46,25 @@ W8A8 SGL kernel 结果文件：
 - 端到端 GPU latency 从 `88.261 ms` 增加到 `130.174 ms`，增加约 `41.9 ms`。
 - 主要变慢来自 VLM，VLM 从 `48.800 ms` 增加到 `89.001 ms`。
 - Diffusion 部分基本不是差异来源，两次测试中 diffusion 分别为 `38.161 ms` 和 `39.961 ms`。
+- 加入 fused activation quantization 后，端到端 GPU latency 降到 `91.465 ms`，已经接近 BF16 baseline。
+- fused activation quantization 后，VLM latency 从 `89.001 ms` 降到 `52.124 ms`，说明动态 activation quantization 的分步 kernel launch / memory pass 是之前 W8A8 变慢的主要原因。
+
+fused activation quantization 结果文件：
+
+```text
+/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/w8a8_int8_sgl_kernel_fused_quant_2b_uniform050_ddim3_maxnum6_pil_parallel_no_resize_fastddim_compact_v1_50.json
+```
+
+单独 kernel smoke test：
+
+```text
+shape = [1024, 2048], dtype = bf16
+scale max err = 0.0
+q max diff = 1
+q mean diff = 0.000157
+fused_quant_ms = 0.0112 ms
+torch_quant_ms = 0.0881 ms
+```
 
 ## 细分观察
 
@@ -133,4 +153,3 @@ RecogDrive 当前 VLM 推理是小 batch 场景，视觉 token 经过 pruning �
 4. 尝试 W8A16 / weight-only 量化，避免动态 activation quantization。
 5. 尝试 fused activation quantization kernel，至少把 `amax + scale + quantize` 融合成单个 CUDA kernel。
 6. 如果后续目标仍是 910B，需要优先考虑 Ascend 上可用的 int8 matmul / quantize 融合能力，而不是只针对 CUDA kernel 做过深优化。
-

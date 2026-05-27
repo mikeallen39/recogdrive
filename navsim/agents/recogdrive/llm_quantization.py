@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from navsim.agents.recogdrive.int8_quant_kernels import fused_quantize_activation_per_token_int8
 
 try:
     from sgl_kernel import int8_scaled_mm as sgl_int8_scaled_mm
@@ -105,6 +108,8 @@ def _quantize_weight_per_output_channel_int8(weight: torch.Tensor, eps: float = 
 
 
 def _quantize_activation_per_token_int8(x: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
+    if os.environ.get("RECOGDRIVE_USE_FUSED_INT8_QUANT", "1") == "1":
+        return fused_quantize_activation_per_token_int8(x, eps=eps)
     qmax = torch.iinfo(torch.int8).max
     values = x.float()
     scale = values.detach().abs().amax(dim=1, keepdim=True).clamp(min=eps) / qmax
