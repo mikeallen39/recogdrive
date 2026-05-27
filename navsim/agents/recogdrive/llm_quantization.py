@@ -154,6 +154,61 @@ class W8A8Int8Linear(nn.Module):
         return out.reshape(*x.shape[:-1], self.out_features)
 
 
+class W8A8Qwen2UpGateMLP(nn.Module):
+    """Qwen2 MLP wrapper that quantizes the shared FFN input once for gate/up."""
+
+    def __init__(self, mlp: nn.Module):
+        super().__init__()
+        if sgl_int8_scaled_mm is None:
+            raise ImportError("w8a8_int8 requires sgl_kernel.int8_scaled_mm") from _SGL_KERNEL_IMPORT_ERROR
+        self.hidden_size = mlp.hidden_size
+        self.intermediate_size = mlp.intermediate_size
+        self.act_fn = mlp.act_fn
+        self.down_proj = mlp.down_proj
+
+        gate_qweight, gate_weight_scale = _quantize_weight_per_output_channel_int8(mlp.gate_proj.weight)
+        up_qweight, up_weight_scale = _quantize_weight_per_output_channel_int8(mlp.up_proj.weight)
+        self.register_buffer("gate_qweight", gate_qweight.contiguous())
+        self.register_buffer("gate_weight_scale", gate_weight_scale.flatten().contiguous())
+        self.register_buffer("up_qweight", up_qweight.contiguous())
+        self.register_buffer("up_weight_scale", up_weight_scale.flatten().contiguous())
+
+        self.gate_bias = (
+            None
+            if mlp.gate_proj.bias is None
+            else nn.Parameter(mlp.gate_proj.bias.detach().clone(), requires_grad=False)
+        )
+        self.up_bias = (
+            None
+            if mlp.up_proj.bias is None
+            else nn.Parameter(mlp.up_proj.bias.detach().clone(), requires_grad=False)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output_dtype = x.dtype
+        x_2d = x.reshape(-1, self.hidden_size).contiguous()
+        x_q, x_scale = _quantize_activation_per_token_int8(x_2d)
+        x_scale = x_scale.flatten().contiguous()
+        gate = sgl_int8_scaled_mm(
+            x_q,
+            self.gate_qweight.t(),
+            x_scale,
+            self.gate_weight_scale,
+            output_dtype,
+            self.gate_bias,
+        )
+        up = sgl_int8_scaled_mm(
+            x_q,
+            self.up_qweight.t(),
+            x_scale,
+            self.up_weight_scale,
+            output_dtype,
+            self.up_bias,
+        )
+        hidden = self.act_fn(gate) * up
+        return self.down_proj(hidden.reshape(*x.shape[:-1], self.intermediate_size))
+
+
 W8A8FakeQuantLinear = FakeQuantLinear
 W8A8FakeQuantConv2d = FakeQuantConv2d
 
@@ -199,6 +254,7 @@ def apply_fake_quant(
 def apply_w8a8_int8_quant(
     module: nn.Module,
     skip_name_suffixes: Tuple[str, ...] = ("lm_head",),
+    include_name_suffixes: Tuple[str, ...] | None = None,
     mode: str = "w8a8_int8",
 ) -> QuantizationSummary:
     replaced_linears = 0
@@ -208,6 +264,11 @@ def apply_w8a8_int8_quant(
         for name, child in list(parent.named_children()):
             child_prefix = f"{prefix}.{name}" if prefix else name
             if any(child_prefix.endswith(suffix) for suffix in skip_name_suffixes):
+                continue
+            if include_name_suffixes is not None and not any(
+                child_prefix.endswith(suffix) for suffix in include_name_suffixes
+            ):
+                convert(child, child_prefix)
                 continue
             if isinstance(child, nn.Linear):
                 setattr(parent, name, W8A8Int8Linear(child))
@@ -272,6 +333,45 @@ def apply_llm_w8a8_int8_quant(
         module,
         skip_name_suffixes=skip_name_suffixes,
         mode="w8a8_int8",
+    )
+
+
+def apply_llm_w8a8_int8_up_gate_quant(
+    module: nn.Module,
+    skip_name_suffixes: Tuple[str, ...] = ("lm_head",),
+) -> QuantizationSummary:
+    replaced_linears = 0
+
+    def is_qwen2_mlp(child: nn.Module) -> bool:
+        return all(hasattr(child, attr) for attr in ("gate_proj", "up_proj", "down_proj", "act_fn")) and isinstance(
+            child.gate_proj, nn.Linear
+        ) and isinstance(child.up_proj, nn.Linear)
+
+    def convert(parent: nn.Module, prefix: str = "") -> None:
+        nonlocal replaced_linears
+        for name, child in list(parent.named_children()):
+            child_prefix = f"{prefix}.{name}" if prefix else name
+            if any(child_prefix.endswith(suffix) for suffix in skip_name_suffixes):
+                continue
+            if is_qwen2_mlp(child):
+                setattr(parent, name, W8A8Qwen2UpGateMLP(child))
+                replaced_linears += 2
+            else:
+                convert(child, child_prefix)
+
+    convert(module)
+    return QuantizationSummary(mode="w8a8_int8_up_gate", replaced_linears=replaced_linears, replaced_convs=0)
+
+
+def apply_llm_w8a8_int8_up_gate_linear_quant(
+    module: nn.Module,
+    skip_name_suffixes: Tuple[str, ...] = ("lm_head",),
+) -> QuantizationSummary:
+    return apply_w8a8_int8_quant(
+        module,
+        skip_name_suffixes=skip_name_suffixes,
+        include_name_suffixes=("gate_proj", "up_proj"),
+        mode="w8a8_int8_up_gate_linear",
     )
 
 

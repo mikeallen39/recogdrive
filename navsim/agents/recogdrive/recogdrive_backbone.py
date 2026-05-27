@@ -10,6 +10,7 @@ from .prompt_utils import FULL_SYSTEM_MESSAGE, get_system_message
 from .llm_quantization import (
     apply_llm_fake_quant,
     apply_llm_w8a8_int8_quant,
+    apply_llm_w8a8_int8_up_gate_quant,
     apply_vision_w8a8_fake_quant,
     apply_vision_w8a8_int8_quant,
 )
@@ -102,6 +103,13 @@ class RecogDriveBackbone(nn.Module):
             return
         if self.llm_quant_mode == "w8a8_int8":
             summary = apply_llm_w8a8_int8_quant(self.model.language_model)
+            print(
+                f"Applied LLM quantization mode '{summary.mode}' "
+                f"to {summary.replaced_linears} Linear layers."
+            )
+            return
+        if self.llm_quant_mode == "w8a8_int8_up_gate":
+            summary = apply_llm_w8a8_int8_up_gate_quant(self.model.language_model)
             print(
                 f"Applied LLM quantization mode '{summary.mode}' "
                 f"to {summary.replaced_linears} Linear layers."

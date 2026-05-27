@@ -153,3 +153,198 @@ RecogDrive 当前 VLM 推理是小 batch 场景，视觉 token 经过 pruning �
 4. 尝试 W8A16 / weight-only 量化，避免动态 activation quantization。
 5. 尝试 fused activation quantization kernel，至少把 `amax + scale + quantize` 融合成单个 CUDA kernel。
 6. 如果后续目标仍是 910B，需要优先考虑 Ascend 上可用的 int8 matmul / quantize 融合能力，而不是只针对 CUDA kernel 做过深优化。
+
+## Linear Microbenchmark
+
+为了判断 W8A8 从 BF16 切换到 int8 后，单独 Linear 计算本身是否有收益，在 GPU6 上做了 microbenchmark。该测试拆分为三项：
+
+- `BF16 Linear`：直接执行 `F.linear(x, weight, bias)`。
+- `Int8 GEMM only`：输入 activation 和 weight 均已经预先量化，只测 `sgl_kernel.int8_scaled_mm`。
+- `W8A8 total`：在线执行 fused activation quantization，再执行 `sgl_kernel.int8_scaled_mm`。
+
+测试结果文件：
+
+```text
+/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/w8a8_linear_microbench_gpu6.json
+```
+
+| Shape | BF16 Linear | Int8 GEMM only | Fused quant | W8A8 total | Int8 GEMM speedup | W8A8 total speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| LLM attn/o `M=580,K=1536,N=1536` | 0.0266 ms | 0.0174 ms | 0.0086 ms | 0.0243 ms | 1.52x | 1.09x |
+| LLM FFN up/gate `M=580,K=1536,N=8960` | 0.0920 ms | 0.0551 ms | 0.0087 ms | 0.0654 ms | 1.67x | 1.41x |
+| LLM FFN down `M=580,K=8960,N=1536` | 0.1009 ms | 0.0658 ms | 0.0223 ms | 0.1009 ms | 1.53x | 1.00x |
+| Vision attn/o `M=2304,K=1024,N=1024` | 0.0343 ms | 0.0236 ms | 0.0128 ms | 0.0360 ms | 1.45x | 0.95x |
+| Vision FFN up `M=2304,K=1024,N=4096` | 0.0982 ms | 0.0614 ms | 0.0126 ms | 0.0794 ms | 1.60x | 1.24x |
+| Vision FFN down `M=2304,K=4096,N=1024` | 0.1101 ms | 0.0614 ms | 0.0417 ms | 0.1108 ms | 1.79x | 0.99x |
+
+结论：
+
+- 单看 `int8_scaled_mm`，W8A8 的 Linear 计算本身是有收益的，速度约为 BF16 Linear 的 `1.45x` 到 `1.79x`。
+- 加上 activation quantization 后，收益明显收窄。
+- FFN up/gate projection 最值得量化，例如 LLM `1536 -> 8960` 的 W8A8 total 仍有 `1.41x`。
+- down projection 的 `K` 很大，activation quantization 需要扫描更长的 token hidden 维度，量化开销会吃掉 int8 GEMM 的收益。
+- attention / o projection 的收益较小或不稳定，尤其 vision attention/o 在 total latency 下略慢于 BF16。
+
+### 为什么 Int8 GEMM Only 没有达到 BF16 Linear 的 2 倍速度
+
+理论上 int8 Tensor Core 的峰值吞吐通常高于 BF16，容易让人预期能接近 `2x`。但当前 microbenchmark 中 `int8_scaled_mm` 只有 `1.45x` 到 `1.79x`，原因主要有以下几点。
+
+第一，当前测的不是普通 int8 GEMM，而是 `scaled_mm`。它不只是做 `int8 x int8 -> int32` 矩阵乘，还要在输出侧应用 activation scale 和 weight scale，并输出 BF16。这部分 scale 处理和 epilogue 会额外消耗带宽和指令，不能按纯 int8 GEMM 峰值估算。
+
+第二，BF16 baseline 已经很强。A800 上 BF16 Tensor Core、cuBLAS / PyTorch Linear 路径非常成熟，对这些规则矩阵 shape 的利用率很高。W8A8 不是和低效 FP32 比，而是在和高度优化的 BF16 GEMM 比。
+
+第三，实际 shape 不一定能把 int8 Tensor Core 吃满。当前典型 shape 是 `M=580` 或 `M=2304`，`K/N` 由 InternVL 2B 的 hidden / FFN 维度决定。部分 shape 的 tile 利用率、wave quantization、occupancy、memory access pattern 不一定正好落在 SGL kernel 的最优区间。
+
+第四，`sgl_kernel.int8_scaled_mm` 是通用 kernel，并不是专门为 RecogDrive / InternVL 2B 的固定 shape autotune 出来的。BF16 Linear 往往走 cuBLASLt 的成熟 heuristic，而当前 int8 kernel 的 tile 选择未必对每个 projection 最优。
+
+第五，当前 benchmark 保留了 bias 和 BF16 输出，实际输出仍要写回 BF16 tensor。对于这些中小矩阵，输出写回、scale 读写、bias 加法等非 GEMM 主体开销占比不可忽略，会降低相对于 BF16 的理论加速比。
+
+因此，当前更合理的优化策略不是假设所有 Linear 都能获得 `2x`，而是按 shape 做选择性量化：
+
+- 优先量化 FFN up/gate 这种 `K` 适中、`N` 很大的 projection。
+- 谨慎量化 down projection，因为 activation quantization 成本随 `K` 增大明显增加。
+- attention q/k/v/o projection 需要结合端到端 profiling 判断，不能默认量化。
+
+## LLM Up/Gate 选择性量化
+
+基于 microbenchmark，进一步测试只量化 Qwen2 LLM MLP 中的 `gate_proj` 和 `up_proj`，保留 attention、`down_proj`、vision encoder 为 BF16。
+
+### Naive Linear 替换
+
+第一版实现直接把 `gate_proj` 和 `up_proj` 两个 Linear 分别替换成 `W8A8Int8Linear`。该实现的问题是 Qwen2 MLP 中两个 projection 共享同一个输入 `x`，但 naive 替换会重复做两次 activation quantization：
+
+```text
+gate_proj: quant(x) + int8 GEMM
+up_proj:   quant(x) + int8 GEMM
+```
+
+测试结果文件：
+
+```text
+/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/w8a8_int8_llm_up_gate_only_2b_uniform050_ddim3_maxnum6_pil_parallel_no_resize_fastddim_compact_v1_50.json
+```
+
+同 GPU6 BF16 baseline 对比：
+
+| 配置 | E2E mean | VLM mean | LLM mean | Diffusion mean |
+|---|---:|---:|---:|---:|
+| BF16 current GPU6 | 89.789 ms | 49.610 ms | 25.880 ms | 38.360 ms |
+| Up/Gate naive Linear W8A8 | 89.095 ms | 50.105 ms | 26.967 ms | 37.230 ms |
+| Delta | -0.695 ms | +0.495 ms | +1.087 ms | -1.129 ms |
+
+结论：naive Linear 替换没有带来真实 VLM 加速。E2E mean 略低主要来自 diffusion 波动，而 VLM / LLM 本身变慢。
+
+### MLP Wrapper 共享 Quantization
+
+第二版实现把整个 Qwen2 MLP 替换为 wrapper：
+
+```text
+x_q, x_scale = quant(x)
+gate = int8_scaled_mm(x_q, gate_weight, x_scale, gate_scale)
+up   = int8_scaled_mm(x_q, up_weight,   x_scale, up_scale)
+out  = down_proj(act(gate) * up)
+```
+
+这样 `gate_proj` 和 `up_proj` 共享同一次 activation quantization，`down_proj` 保持 BF16。
+
+测试结果文件：
+
+```text
+/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/w8a8_int8_llm_up_gate_shared_quant_2b_uniform050_ddim3_maxnum6_pil_parallel_no_resize_fastddim_compact_v1_50.json
+```
+
+同 GPU6 BF16 baseline 对比：
+
+| 配置 | E2E mean | VLM mean | LLM mean | Diffusion mean |
+|---|---:|---:|---:|---:|
+| BF16 current GPU6 | 89.789 ms | 49.610 ms | 25.880 ms | 38.360 ms |
+| Up/Gate MLP shared-quant W8A8 | 88.933 ms | 49.140 ms | 25.574 ms | 37.368 ms |
+| Delta | -0.856 ms | -0.470 ms | -0.306 ms | -0.991 ms |
+
+结论：
+
+- 共享 activation quantization 后，LLM 从 `+1.087 ms` 变成 `-0.306 ms`，说明重复 quantization 是 naive up/gate 量化变慢的主要原因。
+- VLM mean 从 `49.610 ms` 降到 `49.140 ms`，获得约 `0.47 ms` 的真实 VLM 加速。
+- E2E mean 降低约 `0.86 ms`，其中约 `0.47 ms` 来自 VLM，剩余主要来自本次 diffusion 测量波动。
+- 当前选择性 W8A8 的收益存在但较小，说明进一步优化需要继续减少 kernel launch，或者在更多真正有收益的模块上做共享 quantization / grouped GEMM。
+
+## 降低 Activation 动态量化开销的方向
+
+当前 W8A8 真量化中，weight 是初始化时静态量化并缓存为 int8 buffer，forward 阶段的主要额外开销来自 activation 动态量化。虽然 fused activation quantization 已经把 `amax + scale + round/clamp + cast int8` 合成单个 CUDA kernel，但端到端结果显示 activation quantization 仍会明显吃掉 int8 GEMM 的收益，尤其是 down projection 这类 `K` 较大的 Linear。
+
+后续优化应优先减少 activation quantization 的次数，而不是继续单独优化单次 quant kernel。
+
+### 1. 共享同输入的 Activation Quantization
+
+同一个 hidden state 同时输入多个 Linear 时，应只做一次 activation quantization，然后复用 `x_q / x_scale`。
+
+已验证的例子是 Qwen2 MLP 的 `gate_proj` 和 `up_proj`。naive Linear 替换会对同一个 `x` 重复量化两次；改成 MLP wrapper 后只量化一次，LLM latency 从比 BF16 慢 `+1.087 ms` 变成比 BF16 快 `-0.306 ms`。
+
+可继续尝试的方向：
+
+- 对 attention 的 `q_proj / k_proj / v_proj` 做 QKV wrapper，共享一次 activation quantization。
+- 将 QKV weight 在输出维度 concat，尽量用一次 int8 GEMM 产生 `qkv`，再 split。
+- 对 MLP `gate_proj / up_proj` 进一步 concat weight，用一次 int8 GEMM 代替当前两次 `int8_scaled_mm`。
+
+该方向风险较低，因为量化粒度和数值路径不变，主要改变 kernel launch 数量和 GEMM 组织方式。
+
+### 2. Static Activation Scale / Calibration
+
+可以用一批 navtest 或训练集样本离线统计每层 activation scale，推理时不再做 per-token `amax` reduction，只执行 `x / scale -> int8`。
+
+潜在收益：
+
+- 去掉动态 `amax` reduction。
+- 减少 per-token scale 计算和 scale tensor 写回。
+- 对固定场景、固定 prompt、固定图像 tile 数的 RecogDrive 推理比较友好。
+
+主要风险是精度下降。RecogDrive 的场景分布、图像 token 和语言 token 的 activation 范围可能有明显长尾，直接使用静态 scale 可能导致局部饱和。建议先只在 LLM FFN `gate/up` 上尝试，再扩展到 attention 或 vision encoder。
+
+### 3. SmoothQuant 类方法
+
+SmoothQuant 的思路是把 activation outlier 的一部分缩放迁移到 weight 上，使 activation 分布更平滑，从而更适合静态或低成本 activation quantization。
+
+相比直接 static scale，它的精度风险更低，但需要 calibration，并且需要修改 weight：
+
+```text
+Y = X W
+X_smooth = X / s
+W_smooth = s W
+Y = X_smooth W_smooth
+```
+
+可行实验路径：
+
+- 对 LLM Linear 做 per-channel smoothing calibration。
+- 优先覆盖 `gate_proj / up_proj`，因为这两个 projection 当前最有 W8A8 收益。
+- 保留 `down_proj` BF16，避免大 `K` 下 activation quantization 成本和精度风险同时放大。
+
+该方向更接近实际部署方案，但实现复杂度高于共享 quant wrapper。
+
+### 4. Producer + Quant Fusion
+
+很多 int8 Linear 的输入并不是原始 tensor，而是前一个轻量算子的输出，例如 RMSNorm、residual add、AdaLN、SiLU/mul 等。如果先把这些结果写回 BF16，再单独读出来做 activation quantization，会产生额外 kernel launch 和显存读写。
+
+可以考虑的融合：
+
+- `RMSNorm + activation quant`
+- `residual add + RMSNorm + activation quant`
+- `SiLU(gate) * up + activation quant`
+
+该方向可以直接减少 kernel launch 和中间 tensor 读写，但需要更深的自定义 kernel。考虑到最终目标是 910B，不建议只为 A800 写过深的 CUDA-only 实现；更适合作为验证理论上限，或后续迁移到 Ascend C / CANN 自定义算子。
+
+### 5. 降低 Scale 粒度
+
+当前 activation 是 per-token 动态 scale。可以尝试 per-sequence、per-block token、或者固定 group token scale，减少 reduction 数量和 scale tensor 开销。
+
+这个方向的代价是量化更粗，精度风险高于 per-token。自动驾驶输入具有结构化特点，理论上可以按 token 类型或空间区域分组，但这会引入额外设计复杂度。建议排在共享 quantization、static scale / SmoothQuant 之后。
+
+### 优先级建议
+
+短期最值得做的是：
+
+1. `gate/up` concat GEMM：在已有 MLP shared-quant 基础上进一步减少一次 GEMM launch。
+2. QKV wrapper：如果 attention projection 的 microbenchmark 显示有收益，再共享一次 activation quantization 并 concat QKV weight。
+3. static activation scale / SmoothQuant：用于验证能否从根本上减少动态 quantization 成本。
+
+不建议优先做的是通用 dynamic activation quant + GEMM 单 kernel 深度融合。开源生态中成熟可直接复用的实现较少，而且最终部署目标是 910B，CUDA-only 的深度融合维护成本和迁移成本都偏高。
