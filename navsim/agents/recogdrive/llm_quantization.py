@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from navsim.agents.recogdrive.int8_quant_kernels import (
+    fused_layernorm_quantize_activation_per_token_int8,
     fused_quantize_activation_per_token_int8,
     fused_rmsnorm_quantize_activation_per_token_int8,
     fused_rmsnorm_static_quantize_activation_int8,
@@ -517,6 +518,172 @@ class W8A8Qwen2DecoderLayerRMSQuant(nn.Module):
         return outputs
 
 
+class W8A8InternVisionAttention(nn.Module):
+    """InternViT attention with fused LayerNorm-provided activation quantization for qkv."""
+
+    def __init__(self, attention: nn.Module):
+        super().__init__()
+        if sgl_int8_scaled_mm is None:
+            raise ImportError("w8a8_int8 requires sgl_kernel.int8_scaled_mm") from _SGL_KERNEL_IMPORT_ERROR
+        self.config = attention.config
+        self.embed_dim = attention.embed_dim
+        self.num_heads = attention.num_heads
+        self.head_dim = attention.head_dim
+        self.scale = attention.scale
+        self.attn_drop = attention.attn_drop
+        self.proj_drop = attention.proj_drop
+        self.qk_normalization = attention.qk_normalization
+        if self.qk_normalization:
+            self.q_norm = attention.q_norm
+            self.k_norm = attention.k_norm
+        self.use_flash_attn = attention.use_flash_attn
+        if self.use_flash_attn:
+            self.inner_attn = attention.inner_attn
+        self.proj = W8A8Int8Linear(attention.proj)
+
+        qkv_qweight, qkv_weight_scale = _quantize_weight_per_output_channel_int8(attention.qkv.weight)
+        self.register_buffer("qkv_qweight", qkv_qweight.contiguous())
+        self.register_buffer("qkv_weight_scale", qkv_weight_scale.flatten().contiguous())
+        if attention.qkv.bias is None:
+            self.qkv_bias = None
+        else:
+            self.qkv_bias = nn.Parameter(attention.qkv.bias.detach().clone(), requires_grad=False)
+
+    def forward_quantized(
+        self,
+        x_q: torch.Tensor,
+        x_scale: torch.Tensor,
+        input_shape: Tuple[int, ...],
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        batch_size, seq_len = input_shape
+        qkv = sgl_int8_scaled_mm(
+            x_q,
+            self.qkv_qweight.t(),
+            x_scale.flatten().contiguous(),
+            self.qkv_weight_scale if self.qkv_weight_scale.dtype == torch.float32 else self.qkv_weight_scale.float(),
+            output_dtype,
+            self.qkv_bias,
+        ).reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+
+        if self.qk_normalization:
+            q, k, v = qkv.unbind(2)
+            q = self.q_norm(q.flatten(-2, -1)).view(q.shape)
+            k = self.k_norm(k.flatten(-2, -1)).view(k.shape)
+            qkv = torch.stack([q, k, v], dim=2)
+
+        if self.use_flash_attn:
+            context, _ = self.inner_attn(qkv, key_padding_mask=None, need_weights=False, causal=False)
+            hidden_states = context.reshape(batch_size, seq_len, self.embed_dim)
+        else:
+            q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+            attn = (q * self.scale) @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            hidden_states = (attn @ v).transpose(1, 2).reshape(batch_size, seq_len, self.embed_dim)
+
+        hidden_states = self.proj(hidden_states)
+        return self.proj_drop(hidden_states)
+
+
+class W8A8InternVisionMLP(nn.Module):
+    """InternViT MLP with fused LayerNorm-provided activation quantization for fc1."""
+
+    def __init__(self, mlp: nn.Module):
+        super().__init__()
+        if sgl_int8_scaled_mm is None:
+            raise ImportError("w8a8_int8 requires sgl_kernel.int8_scaled_mm") from _SGL_KERNEL_IMPORT_ERROR
+        self.hidden_size = mlp.fc1.in_features
+        self.intermediate_size = mlp.fc1.out_features
+        self.act = mlp.act
+        self.fc2 = W8A8Int8Linear(mlp.fc2)
+
+        fc1_qweight, fc1_weight_scale = _quantize_weight_per_output_channel_int8(mlp.fc1.weight)
+        self.register_buffer("fc1_qweight", fc1_qweight.contiguous())
+        self.register_buffer("fc1_weight_scale", fc1_weight_scale.flatten().contiguous())
+        if mlp.fc1.bias is None:
+            self.fc1_bias = None
+        else:
+            self.fc1_bias = nn.Parameter(mlp.fc1.bias.detach().clone(), requires_grad=False)
+
+    def forward_quantized(
+        self,
+        x_q: torch.Tensor,
+        x_scale: torch.Tensor,
+        input_shape: Tuple[int, ...],
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        hidden_states = sgl_int8_scaled_mm(
+            x_q,
+            self.fc1_qweight.t(),
+            x_scale.flatten().contiguous(),
+            self.fc1_weight_scale if self.fc1_weight_scale.dtype == torch.float32 else self.fc1_weight_scale.float(),
+            output_dtype,
+            self.fc1_bias,
+        )
+        hidden_states = self.act(hidden_states.reshape(*input_shape, self.intermediate_size))
+        return self.fc2(hidden_states)
+
+
+class W8A8InternVisionEncoderLayerLayerNormQuant(nn.Module):
+    """InternViT encoder layer that fuses LayerNorm producer with W8A8 activation quantization."""
+
+    def __init__(self, layer: nn.Module):
+        super().__init__()
+        self.embed_dim = layer.embed_dim
+        self.intermediate_size = layer.intermediate_size
+        self.norm_type = layer.norm_type
+        self.attn = W8A8InternVisionAttention(layer.attn)
+        self.mlp = W8A8InternVisionMLP(layer.mlp)
+        self.norm1 = layer.norm1
+        self.norm2 = layer.norm2
+        self.ls1 = layer.ls1
+        self.ls2 = layer.ls2
+        self.drop_path1 = layer.drop_path1
+        self.drop_path2 = layer.drop_path2
+
+    @staticmethod
+    def _layernorm_eps(norm: nn.Module) -> float:
+        if hasattr(norm, "eps"):
+            return float(norm.eps)
+        return 1e-6
+
+    def _layernorm_quantize(self, hidden_states: torch.Tensor, norm: nn.Module) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden_2d = hidden_states.reshape(-1, self.embed_dim).contiguous()
+        if not isinstance(norm, nn.LayerNorm):
+            raise TypeError("vision LayerNorm+Quant mode requires nn.LayerNorm in InternViT encoder")
+        if norm.bias is None:
+            raise TypeError("vision LayerNorm+Quant mode requires LayerNorm bias")
+        return fused_layernorm_quantize_activation_per_token_int8(
+            hidden_2d,
+            norm.weight,
+            norm.bias,
+            layernorm_eps=self._layernorm_eps(norm),
+            quant_eps=1e-6,
+        )
+
+    def forward(self, hidden_states: torch.Tensor):
+        input_shape = hidden_states.shape[:-1]
+        x_q, x_scale = self._layernorm_quantize(hidden_states, self.norm1)
+        attn_out = self.attn.forward_quantized(
+            x_q=x_q,
+            x_scale=x_scale,
+            input_shape=input_shape,
+            output_dtype=hidden_states.dtype,
+        )
+        hidden_states = hidden_states + self.drop_path1(attn_out * self.ls1)
+
+        x_q, x_scale = self._layernorm_quantize(hidden_states, self.norm2)
+        mlp_out = self.mlp.forward_quantized(
+            x_q=x_q,
+            x_scale=x_scale,
+            input_shape=input_shape,
+            output_dtype=hidden_states.dtype,
+        )
+        hidden_states = hidden_states + self.drop_path2(mlp_out * self.ls2)
+        return hidden_states
+
+
 W8A8FakeQuantLinear = FakeQuantLinear
 W8A8FakeQuantConv2d = FakeQuantConv2d
 
@@ -812,4 +979,42 @@ def apply_vision_w8a8_int8_quant(module: nn.Module) -> QuantizationSummary:
         module,
         skip_name_suffixes=(),
         mode="w8a8_int8",
+    )
+
+
+def apply_vision_w8a8_int8_layernorm_qkv_fc1_quant(module: nn.Module) -> QuantizationSummary:
+    replaced_linears = 0
+
+    def is_intern_vision_encoder_layer(child: nn.Module) -> bool:
+        return all(
+            hasattr(child, attr)
+            for attr in (
+                "attn",
+                "mlp",
+                "norm1",
+                "norm2",
+                "ls1",
+                "ls2",
+                "drop_path1",
+                "drop_path2",
+                "embed_dim",
+                "intermediate_size",
+                "norm_type",
+            )
+        ) and isinstance(child.norm1, nn.LayerNorm) and isinstance(child.norm2, nn.LayerNorm)
+
+    def convert(parent: nn.Module) -> None:
+        nonlocal replaced_linears
+        for name, child in list(parent.named_children()):
+            if is_intern_vision_encoder_layer(child):
+                setattr(parent, name, W8A8InternVisionEncoderLayerLayerNormQuant(child))
+                replaced_linears += 4
+            else:
+                convert(child)
+
+    convert(module)
+    return QuantizationSummary(
+        mode="w8a8_int8_layernorm_qkv_fc1",
+        replaced_linears=replaced_linears,
+        replaced_convs=0,
     )

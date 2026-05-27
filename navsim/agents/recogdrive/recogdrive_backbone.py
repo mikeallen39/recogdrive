@@ -17,6 +17,7 @@ from .llm_quantization import (
     apply_llm_w8a8_int8_up_gate_quant,
     apply_vision_w8a8_fake_quant,
     apply_vision_w8a8_int8_quant,
+    apply_vision_w8a8_int8_layernorm_qkv_fc1_quant,
 )
 
 IMG_CONTEXT_TOKEN = '<IMG_CONTEXT>'
@@ -185,6 +186,13 @@ class RecogDriveBackbone(nn.Module):
                     f"Applied projector quantization mode '{projector_summary.mode}' "
                     f"to {projector_summary.replaced_linears} Linear layers."
                 )
+            return
+        if self.vision_quant_mode == "w8a8_int8_layernorm_qkv_fc1":
+            summary = apply_vision_w8a8_int8_layernorm_qkv_fc1_quant(self.model.vision_model)
+            print(
+                f"Applied vision quantization mode '{summary.mode}' "
+                f"to {summary.replaced_linears} Linear layers. Conv2d patch embedding is kept in BF16."
+            )
             return
         if self.vision_quant_mode not in {"w8a8_fake", "w8a8_fake_with_projector"}:
             raise ValueError(f"Unsupported vision_quant_mode: {self.vision_quant_mode}")

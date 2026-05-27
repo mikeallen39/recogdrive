@@ -8,7 +8,7 @@ from torch.utils.cpp_extension import load
 
 
 _EXTENSION = None
-_EXTENSION_NAME = "recogdrive_int8_quant_v2"
+_EXTENSION_NAME = "recogdrive_int8_quant_v3"
 
 
 def _load_extension():
@@ -100,4 +100,41 @@ def fused_rmsnorm_static_quantize_activation_int8(
         weight.contiguous(),
         float(rms_eps),
         float(static_scale),
+    )
+
+
+def fused_layernorm_quantize_activation_per_token_int8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    layernorm_eps: float = 1e-6,
+    quant_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not x.is_cuda:
+        raise ValueError("fused LayerNorm + int8 activation quantization requires a CUDA tensor")
+    if not weight.is_cuda:
+        raise ValueError("fused LayerNorm + int8 activation quantization requires a CUDA weight tensor")
+    if not bias.is_cuda:
+        raise ValueError("fused LayerNorm + int8 activation quantization requires a CUDA bias tensor")
+    if x.ndim != 2:
+        raise ValueError("fused LayerNorm + int8 activation quantization requires a 2D tensor")
+    if weight.ndim != 1:
+        raise ValueError("LayerNorm weight must be a 1D tensor")
+    if bias.ndim != 1:
+        raise ValueError("LayerNorm bias must be a 1D tensor")
+    if x.shape[-1] != weight.shape[0] or x.shape[-1] != bias.shape[0]:
+        raise ValueError("activation hidden size must match LayerNorm weight and bias")
+    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"unsupported activation dtype for fused LayerNorm + quantization: {x.dtype}")
+    if weight.dtype != x.dtype:
+        weight = weight.to(dtype=x.dtype)
+    if bias.dtype != x.dtype:
+        bias = bias.to(dtype=x.dtype)
+    ext = _load_extension()
+    return ext.layernorm_quantize_activation_per_token_int8(
+        x.contiguous(),
+        weight.contiguous(),
+        bias.contiguous(),
+        float(layernorm_eps),
+        float(quant_eps),
     )

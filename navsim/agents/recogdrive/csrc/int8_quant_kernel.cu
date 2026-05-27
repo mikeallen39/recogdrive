@@ -174,6 +174,83 @@ __global__ void rmsnorm_static_quantize_activation_int8_kernel(
   }
 }
 
+template <typename scalar_t>
+__global__ void layernorm_quantize_activation_per_token_int8_kernel(
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    int8_t* __restrict__ output,
+    float* __restrict__ scales,
+    int rows,
+    int cols,
+    float layernorm_eps,
+    float quant_eps) {
+  int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  __shared__ float shared_sum[kThreads];
+  __shared__ float shared_sumsq[kThreads];
+  __shared__ float shared_max[kThreads];
+  const scalar_t* row_input = input + static_cast<int64_t>(row) * cols;
+  int8_t* row_output = output + static_cast<int64_t>(row) * cols;
+
+  float local_sum = 0.0f;
+  float local_sumsq = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    float value = static_cast<float>(row_input[col]);
+    local_sum += value;
+    local_sumsq += value * value;
+  }
+
+  shared_sum[threadIdx.x] = local_sum;
+  shared_sumsq[threadIdx.x] = local_sumsq;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared_sum[threadIdx.x] += shared_sum[threadIdx.x + stride];
+      shared_sumsq[threadIdx.x] += shared_sumsq[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  float mean = shared_sum[0] / static_cast<float>(cols);
+  float variance = shared_sumsq[0] / static_cast<float>(cols) - mean * mean;
+  variance = fmaxf(variance, 0.0f);
+  float inv_std = rsqrtf(variance + layernorm_eps);
+
+  float local_max = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    float value = (static_cast<float>(row_input[col]) - mean) * inv_std;
+    value = value * static_cast<float>(weight[col]) + static_cast<float>(bias[col]);
+    local_max = fmaxf(local_max, fabsf(value));
+  }
+
+  shared_max[threadIdx.x] = local_max;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared_max[threadIdx.x] = fmaxf(shared_max[threadIdx.x], shared_max[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+
+  float scale = fmaxf(shared_max[0], quant_eps) / static_cast<float>(kQMax);
+  if (threadIdx.x == 0) {
+    scales[row] = scale;
+  }
+
+  float inv_scale = 1.0f / scale;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    float value = (static_cast<float>(row_input[col]) - mean) * inv_std;
+    value = (value * static_cast<float>(weight[col]) + static_cast<float>(bias[col])) * inv_scale;
+    row_output[col] = clamp_round_int8(value);
+  }
+}
+
 }  // namespace
 
 std::vector<torch::Tensor> quantize_activation_per_token_int8_cuda(torch::Tensor input, double eps) {
@@ -271,6 +348,44 @@ std::vector<torch::Tensor> rmsnorm_quantize_activation_per_token_int8_cuda(
                 static_cast<int>(rows),
                 static_cast<int>(cols),
                 static_cast<float>(rms_eps),
+                static_cast<float>(quant_eps));
+      });
+
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {output, scales};
+}
+
+std::vector<torch::Tensor> layernorm_quantize_activation_per_token_int8_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    double layernorm_eps,
+    double quant_eps) {
+  const auto rows = input.size(0);
+  const auto cols = input.size(1);
+  auto output = torch::empty({rows, cols}, input.options().dtype(torch::kInt8));
+  auto scales = torch::empty({rows}, input.options().dtype(torch::kFloat32));
+
+  const dim3 grid(rows);
+  const dim3 block(kThreads);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      torch::kHalf,
+      torch::kBFloat16,
+      input.scalar_type(),
+      "layernorm_quantize_activation_per_token_int8_cuda",
+      [&] {
+        layernorm_quantize_activation_per_token_int8_kernel<scalar_t>
+            <<<grid, block, 0, stream>>>(
+                input.data_ptr<scalar_t>(),
+                weight.data_ptr<scalar_t>(),
+                bias.data_ptr<scalar_t>(),
+                output.data_ptr<int8_t>(),
+                scales.data_ptr<float>(),
+                static_cast<int>(rows),
+                static_cast<int>(cols),
+                static_cast<float>(layernorm_eps),
                 static_cast<float>(quant_eps));
       });
 

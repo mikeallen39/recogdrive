@@ -552,3 +552,54 @@ RECOGDRIVE_RMSNORM_STATIC_ACT_SCALE=0.03
 | Diffusion hidden `64x1024` | 0.0100 ms | 0.0101 ms |
 
 LLM 形状下 static scale kernel 与 dynamic fused kernel 基本持平，因此端到端没有进一步收益是符合预期的。static scale 更可能带来收益的前提是进一步减少 scale tensor 写回、或者让后续 GEMM kernel 原生支持 scalar/per-layer scale，而不是仍然走 per-token scale tensor 接口。
+
+### Vision Encoder LayerNorm+Quant 初步测试
+
+背景：ReCogDrive 2B 的 InternVL vision encoder 使用 `LayerNorm`，不是 LLM 里的 `RMSNorm`：
+
+```text
+hidden -> norm1 -> attn.qkv
+hidden -> norm2 -> mlp.fc1
+```
+
+因此不能直接复用 `RMSNorm+Quant` kernel。本次新增 `w8a8_int8_layernorm_qkv_fc1` vision quant mode：
+
+```text
+LayerNorm(norm1) + dynamic activation quant -> attn.qkv int8 GEMM
+LayerNorm(norm2) + dynamic activation quant -> mlp.fc1 int8 GEMM
+attn.proj / mlp.fc2 -> 继续使用已有 W8A8 int8 Linear
+Conv2d patch embedding -> 保持 BF16
+```
+
+实现细节：
+
+- 新增 CUDA extension 接口 `layernorm_quantize_activation_per_token_int8`。
+- extension 名称从 `recogdrive_int8_quant_v2` 改为 `recogdrive_int8_quant_v3`，避免加载旧缓存 `.so`。
+- vision encoder 每层 wrapper 为 `W8A8InternVisionEncoderLayerLayerNormQuant`，只替换 24 个 InternViT encoder layer，不改 patch embedding 和 position embedding。
+- 小 shape 数值自检中，fused LayerNorm+Quant 与 PyTorch `layer_norm + per-token quant` 的 int8 最大差值为 `1`，主要来自 BF16/FP32 和四舍五入边界差异。
+
+Latency 结果文件：
+
+```text
+/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/w8a8_int8_rmsnorm_up_gate_qkv_vision_layernorm_qkv_fc1_2b_uniform050_ddim3_maxnum6_pil_parallel_no_resize_fastddim_compact_v1_50.json
+```
+
+同配置均为：
+
+```text
+2B + uniform pruning 0.50 + DDIM3 + image_max_num=6 / 3 tiles
++ pil_parallel_no_resize + addcmul_pointwise + fast DDIM + compact_v1
++ LLM w8a8_int8_rmsnorm_up_gate_qkv
+```
+
+| 配置 | E2E mean | VLM mean | Vision mean | LLM mean | Diffusion mean |
+|---|---:|---:|---:|---:|---:|
+| Vision BF16 | 78.295 ms | 40.763 ms | 16.947 ms | 17.417 ms | 37.029 ms |
+| Vision LayerNorm+Quant W8A8 | 79.795 ms | 40.115 ms | 16.205 ms | 17.735 ms | 38.034 ms |
+
+结论：
+
+- vision encoder 局部从 `16.947 ms` 降到 `16.205 ms`，收益约 `0.74 ms`。
+- VLM mean 从 `40.763 ms` 降到 `40.115 ms`，收益约 `0.65 ms`。
+- E2E mean 没有改善，主要是本次 50-sample 中 diffusion 和 E2E 计时有少量抖动，且 vision 局部收益本身较小。
+- 该方案说明 `LayerNorm producer + quant` 在 vision encoder 中可用，但收益明显小于 LLM 的 RMSNorm+Quant。后续如果继续优化 vision encoder，优先级应高于这个小融合的是 token 数缩减、ViT 内部 early token pruning/merge，或者更深的 attention/MLP 结构级优化。
