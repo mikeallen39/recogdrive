@@ -7,6 +7,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+try:
+    from sgl_kernel import int8_scaled_mm as sgl_int8_scaled_mm
+except ImportError as exc:
+    sgl_int8_scaled_mm = None
+    _SGL_KERNEL_IMPORT_ERROR = exc
+else:
+    _SGL_KERNEL_IMPORT_ERROR = None
+
 
 @dataclass(frozen=True)
 class QuantizationSummary:
@@ -105,34 +113,40 @@ def _quantize_activation_per_token_int8(x: torch.Tensor, eps: float = 1e-6) -> T
 
 
 class W8A8Int8Linear(nn.Module):
-    """True W8A8 Linear using int8 x int8 -> int32 matmul.
+    """True W8A8 Linear using SGLang's fused int8 scaled-mm kernel.
 
-    This is an inference-only dynamic-activation path. It uses PyTorch's native
-    int8 matmul as the first portable backend; the module boundary is kept small
-    so the matmul can later be swapped to SGLang/vLLM CUTLASS scaled-mm.
+    This is an inference-only dynamic-activation path. It intentionally requires
+    sgl_kernel instead of falling back to torch._int_mm, because torch._int_mm is
+    much slower for this workload and would pollute latency comparisons.
     """
 
     def __init__(self, linear: nn.Linear):
         super().__init__()
         self.in_features = linear.in_features
         self.out_features = linear.out_features
+        if sgl_int8_scaled_mm is None:
+            raise ImportError("w8a8_int8 requires sgl_kernel.int8_scaled_mm") from _SGL_KERNEL_IMPORT_ERROR
         qweight, weight_scale = _quantize_weight_per_output_channel_int8(linear.weight)
-        self.register_buffer("qweight_t", qweight.t().contiguous())
-        self.register_buffer("weight_scale", weight_scale.t().contiguous())
+        self.register_buffer("qweight", qweight.contiguous())
+        self.register_buffer("weight_scale", weight_scale.flatten().contiguous())
         if linear.bias is None:
             self.bias = None
         else:
-            self.bias = nn.Parameter(linear.bias.detach().float().clone(), requires_grad=False)
+            self.bias = nn.Parameter(linear.bias.detach().clone(), requires_grad=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         output_dtype = x.dtype
         x_2d = x.reshape(-1, self.in_features).contiguous()
         x_q, x_scale = _quantize_activation_per_token_int8(x_2d)
-        acc = torch._int_mm(x_q, self.qweight_t)
-        out = acc.float() * x_scale * self.weight_scale
-        if self.bias is not None:
-            out = out + self.bias
-        return out.to(dtype=output_dtype).reshape(*x.shape[:-1], self.out_features)
+        out = sgl_int8_scaled_mm(
+            x_q,
+            self.qweight.t(),
+            x_scale.flatten().contiguous(),
+            self.weight_scale,
+            output_dtype,
+            self.bias,
+        )
+        return out.reshape(*x.shape[:-1], self.out_features)
 
 
 W8A8FakeQuantLinear = FakeQuantLinear
