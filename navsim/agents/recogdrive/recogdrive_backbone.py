@@ -7,7 +7,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .utils.conversation import get_conv_template
 from .prompt_utils import FULL_SYSTEM_MESSAGE, get_system_message
-from .llm_quantization import apply_llm_w8a8_fake_quant, apply_vision_w8a8_fake_quant
+from .llm_quantization import apply_llm_fake_quant, apply_vision_w8a8_fake_quant
 
 IMG_CONTEXT_TOKEN = '<IMG_CONTEXT>'
 IMG_START_TOKEN = '<img>'
@@ -95,9 +95,20 @@ class RecogDriveBackbone(nn.Module):
     def _configure_llm_quantization(self):
         if self.llm_quant_mode in {"none", "fp16", "bf16", ""}:
             return
-        if self.llm_quant_mode != "w8a8_fake":
+        quant_modes = {
+            "w8a8_fake": (8, 8),
+            "w4a8_fake": (4, 8),
+            "w4a4_fake": (4, 4),
+        }
+        if self.llm_quant_mode not in quant_modes:
             raise ValueError(f"Unsupported llm_quant_mode: {self.llm_quant_mode}")
-        summary = apply_llm_w8a8_fake_quant(self.model.language_model)
+        weight_bits, activation_bits = quant_modes[self.llm_quant_mode]
+        summary = apply_llm_fake_quant(
+            self.model.language_model,
+            weight_bits=weight_bits,
+            activation_bits=activation_bits,
+            mode=self.llm_quant_mode,
+        )
         print(
             f"Applied LLM quantization mode '{summary.mode}' "
             f"to {summary.replaced_linears} Linear layers."
