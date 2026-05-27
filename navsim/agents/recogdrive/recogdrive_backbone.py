@@ -7,7 +7,12 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .utils.conversation import get_conv_template
 from .prompt_utils import FULL_SYSTEM_MESSAGE, get_system_message
-from .llm_quantization import apply_llm_fake_quant, apply_vision_w8a8_fake_quant
+from .llm_quantization import (
+    apply_llm_fake_quant,
+    apply_llm_w8a8_int8_quant,
+    apply_vision_w8a8_fake_quant,
+    apply_vision_w8a8_int8_quant,
+)
 
 IMG_CONTEXT_TOKEN = '<IMG_CONTEXT>'
 IMG_START_TOKEN = '<img>'
@@ -95,6 +100,13 @@ class RecogDriveBackbone(nn.Module):
     def _configure_llm_quantization(self):
         if self.llm_quant_mode in {"none", "fp16", "bf16", ""}:
             return
+        if self.llm_quant_mode == "w8a8_int8":
+            summary = apply_llm_w8a8_int8_quant(self.model.language_model)
+            print(
+                f"Applied LLM quantization mode '{summary.mode}' "
+                f"to {summary.replaced_linears} Linear layers."
+            )
+            return
         quant_modes = {
             "w8a8_fake": (8, 8),
             "w4a8_fake": (4, 8),
@@ -116,6 +128,19 @@ class RecogDriveBackbone(nn.Module):
 
     def _configure_vision_quantization(self):
         if self.vision_quant_mode in {"none", "fp16", "bf16", ""}:
+            return
+        if self.vision_quant_mode in {"w8a8_int8", "w8a8_int8_with_projector"}:
+            summary = apply_vision_w8a8_int8_quant(self.model.vision_model)
+            print(
+                f"Applied vision quantization mode '{summary.mode}' "
+                f"to {summary.replaced_linears} Linear layers. Conv2d patch embedding is kept in BF16."
+            )
+            if self.vision_quant_mode == "w8a8_int8_with_projector":
+                projector_summary = apply_vision_w8a8_int8_quant(self.model.mlp1)
+                print(
+                    f"Applied projector quantization mode '{projector_summary.mode}' "
+                    f"to {projector_summary.replaced_linears} Linear layers."
+                )
             return
         if self.vision_quant_mode not in {"w8a8_fake", "w8a8_fake_with_projector"}:
             raise ValueError(f"Unsupported vision_quant_mode: {self.vision_quant_mode}")

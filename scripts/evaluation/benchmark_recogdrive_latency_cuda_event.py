@@ -426,6 +426,8 @@ def main():
     parser.add_argument("--compile-mode", type=str, default="reduce-overhead")
     parser.add_argument("--fast-ddim-action", action="store_true")
     parser.add_argument("--prompt-variant", type=str, default="full", choices=sorted(PROMPT_VARIANTS))
+    parser.add_argument("--vlm-llm-quant-mode", type=str, default="none")
+    parser.add_argument("--vlm-vision-quant-mode", type=str, default="none")
     parser.add_argument(
         "--dit-pointwise-variant",
         type=str,
@@ -483,6 +485,8 @@ def main():
                 f"agent.vlm_prune_method={args.prune_method}",
                 f"agent.diffusion_num_inference_steps={args.diffusion_steps}",
                 f"agent.prompt_variant={args.prompt_variant}",
+                f"agent.vlm_llm_quant_mode={args.vlm_llm_quant_mode}",
+                f"agent.vlm_vision_quant_mode={args.vlm_vision_quant_mode}",
             ],
         )
 
@@ -580,6 +584,8 @@ def main():
         "compile_mode": args.compile_mode if args.compile_action_head else None,
         "fast_ddim_action": args.fast_ddim_action,
         "prompt_variant": args.prompt_variant,
+        "vlm_llm_quant_mode": args.vlm_llm_quant_mode,
+        "vlm_vision_quant_mode": args.vlm_vision_quant_mode,
         "metrics": {key: summarize(record[key] for record in measured) for key in metric_keys},
         "num_patches": summarize(record["num_patches"] for record in measured),
         "num_visual_tokens": summarize(record["num_visual_tokens"] for record in measured),

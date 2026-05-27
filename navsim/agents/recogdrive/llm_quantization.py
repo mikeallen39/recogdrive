@@ -88,6 +88,53 @@ class FakeQuantConv2d(nn.Module):
         return F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
 
+def _quantize_weight_per_output_channel_int8(weight: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
+    qmax = torch.iinfo(torch.int8).max
+    values = weight.detach().float()
+    scale = values.abs().amax(dim=1, keepdim=True).clamp(min=eps) / qmax
+    quantized = torch.round(values / scale).clamp(-qmax, qmax).to(torch.int8)
+    return quantized, scale
+
+
+def _quantize_activation_per_token_int8(x: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
+    qmax = torch.iinfo(torch.int8).max
+    values = x.float()
+    scale = values.detach().abs().amax(dim=1, keepdim=True).clamp(min=eps) / qmax
+    quantized = torch.round(values / scale).clamp(-qmax, qmax).to(torch.int8)
+    return quantized.contiguous(), scale
+
+
+class W8A8Int8Linear(nn.Module):
+    """True W8A8 Linear using int8 x int8 -> int32 matmul.
+
+    This is an inference-only dynamic-activation path. It uses PyTorch's native
+    int8 matmul as the first portable backend; the module boundary is kept small
+    so the matmul can later be swapped to SGLang/vLLM CUTLASS scaled-mm.
+    """
+
+    def __init__(self, linear: nn.Linear):
+        super().__init__()
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        qweight, weight_scale = _quantize_weight_per_output_channel_int8(linear.weight)
+        self.register_buffer("qweight_t", qweight.t().contiguous())
+        self.register_buffer("weight_scale", weight_scale.t().contiguous())
+        if linear.bias is None:
+            self.bias = None
+        else:
+            self.bias = nn.Parameter(linear.bias.detach().float().clone(), requires_grad=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output_dtype = x.dtype
+        x_2d = x.reshape(-1, self.in_features).contiguous()
+        x_q, x_scale = _quantize_activation_per_token_int8(x_2d)
+        acc = torch._int_mm(x_q, self.qweight_t)
+        out = acc.float() * x_scale * self.weight_scale
+        if self.bias is not None:
+            out = out + self.bias
+        return out.to(dtype=output_dtype).reshape(*x.shape[:-1], self.out_features)
+
+
 W8A8FakeQuantLinear = FakeQuantLinear
 W8A8FakeQuantConv2d = FakeQuantConv2d
 
@@ -128,6 +175,29 @@ def apply_fake_quant(
 
     convert(module)
     return QuantizationSummary(mode=mode, replaced_linears=replaced_linears, replaced_convs=replaced_convs)
+
+
+def apply_w8a8_int8_quant(
+    module: nn.Module,
+    skip_name_suffixes: Tuple[str, ...] = ("lm_head",),
+    mode: str = "w8a8_int8",
+) -> QuantizationSummary:
+    replaced_linears = 0
+
+    def convert(parent: nn.Module, prefix: str = "") -> None:
+        nonlocal replaced_linears
+        for name, child in list(parent.named_children()):
+            child_prefix = f"{prefix}.{name}" if prefix else name
+            if any(child_prefix.endswith(suffix) for suffix in skip_name_suffixes):
+                continue
+            if isinstance(child, nn.Linear):
+                setattr(parent, name, W8A8Int8Linear(child))
+                replaced_linears += 1
+            else:
+                convert(child, child_prefix)
+
+    convert(module)
+    return QuantizationSummary(mode=mode, replaced_linears=replaced_linears, replaced_convs=0)
 
 
 def apply_w8a8_fake_quant(
@@ -175,6 +245,17 @@ def apply_llm_fake_quant(
     )
 
 
+def apply_llm_w8a8_int8_quant(
+    module: nn.Module,
+    skip_name_suffixes: Tuple[str, ...] = ("lm_head",),
+) -> QuantizationSummary:
+    return apply_w8a8_int8_quant(
+        module,
+        skip_name_suffixes=skip_name_suffixes,
+        mode="w8a8_int8",
+    )
+
+
 def apply_vision_w8a8_fake_quant(
     module: nn.Module,
     quantize_conv2d: bool = True,
@@ -184,4 +265,12 @@ def apply_vision_w8a8_fake_quant(
         skip_name_suffixes=(),
         quantize_conv2d=quantize_conv2d,
         mode="w8a8_fake",
+    )
+
+
+def apply_vision_w8a8_int8_quant(module: nn.Module) -> QuantizationSummary:
+    return apply_w8a8_int8_quant(
+        module,
+        skip_name_suffixes=(),
+        mode="w8a8_int8",
     )
