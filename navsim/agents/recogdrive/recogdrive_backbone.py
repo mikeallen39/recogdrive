@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn
@@ -10,6 +11,9 @@ from .prompt_utils import FULL_SYSTEM_MESSAGE, get_system_message
 from .llm_quantization import (
     apply_llm_fake_quant,
     apply_llm_w8a8_int8_quant,
+    apply_llm_w8a8_int8_rmsnorm_up_gate_qkv_quant,
+    apply_llm_w8a8_int8_up_gate_concat_qkv_quant,
+    apply_llm_w8a8_int8_up_gate_concat_quant,
     apply_llm_w8a8_int8_up_gate_quant,
     apply_vision_w8a8_fake_quant,
     apply_vision_w8a8_int8_quant,
@@ -113,6 +117,38 @@ class RecogDriveBackbone(nn.Module):
             print(
                 f"Applied LLM quantization mode '{summary.mode}' "
                 f"to {summary.replaced_linears} Linear layers."
+            )
+            return
+        if self.llm_quant_mode == "w8a8_int8_up_gate_concat":
+            summary = apply_llm_w8a8_int8_up_gate_concat_quant(self.model.language_model)
+            print(
+                f"Applied LLM quantization mode '{summary.mode}' "
+                f"to {summary.replaced_linears} Linear layers."
+            )
+            return
+        if self.llm_quant_mode == "w8a8_int8_up_gate_concat_qkv":
+            summary = apply_llm_w8a8_int8_up_gate_concat_qkv_quant(self.model.language_model)
+            print(
+                f"Applied LLM quantization mode '{summary.mode}' "
+                f"to {summary.replaced_linears} Linear layers."
+            )
+            return
+        if self.llm_quant_mode == "w8a8_int8_rmsnorm_up_gate_qkv":
+            summary = apply_llm_w8a8_int8_rmsnorm_up_gate_qkv_quant(self.model.language_model)
+            print(
+                f"Applied LLM quantization mode '{summary.mode}' "
+                f"to {summary.replaced_linears} Linear layers."
+            )
+            return
+        if self.llm_quant_mode == "w8a8_int8_rmsnorm_static_up_gate_qkv":
+            static_act_scale = float(os.environ.get("RECOGDRIVE_RMSNORM_STATIC_ACT_SCALE", "0.03"))
+            summary = apply_llm_w8a8_int8_rmsnorm_up_gate_qkv_quant(
+                self.model.language_model,
+                static_act_scale=static_act_scale,
+            )
+            print(
+                f"Applied LLM quantization mode '{summary.mode}' "
+                f"to {summary.replaced_linears} Linear layers with static activation scale {static_act_scale}."
             )
             return
         quant_modes = {

@@ -8,7 +8,24 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from navsim.agents.recogdrive.int8_quant_kernels import fused_quantize_activation_per_token_int8
+from navsim.agents.recogdrive.int8_quant_kernels import (
+    fused_quantize_activation_per_token_int8,
+    fused_rmsnorm_quantize_activation_per_token_int8,
+    fused_rmsnorm_static_quantize_activation_int8,
+)
+
+try:
+    from transformers.models.qwen2.modeling_qwen2 import (
+        ALL_ATTENTION_FUNCTIONS,
+        apply_rotary_pos_emb,
+        eager_attention_forward,
+        logger as qwen2_logger,
+    )
+except ImportError:
+    ALL_ATTENTION_FUNCTIONS = None
+    apply_rotary_pos_emb = None
+    eager_attention_forward = None
+    qwen2_logger = None
 
 try:
     from sgl_kernel import int8_scaled_mm as sgl_int8_scaled_mm
@@ -147,7 +164,7 @@ class W8A8Int8Linear(nn.Module):
             x_q,
             self.qweight.t(),
             x_scale.flatten().contiguous(),
-            self.weight_scale,
+            self.weight_scale if self.weight_scale.dtype == torch.float32 else self.weight_scale.float(),
             output_dtype,
             self.bias,
         )
@@ -193,7 +210,7 @@ class W8A8Qwen2UpGateMLP(nn.Module):
             x_q,
             self.gate_qweight.t(),
             x_scale,
-            self.gate_weight_scale,
+            self.gate_weight_scale if self.gate_weight_scale.dtype == torch.float32 else self.gate_weight_scale.float(),
             output_dtype,
             self.gate_bias,
         )
@@ -201,12 +218,303 @@ class W8A8Qwen2UpGateMLP(nn.Module):
             x_q,
             self.up_qweight.t(),
             x_scale,
-            self.up_weight_scale,
+            self.up_weight_scale if self.up_weight_scale.dtype == torch.float32 else self.up_weight_scale.float(),
             output_dtype,
             self.up_bias,
         )
         hidden = self.act_fn(gate) * up
         return self.down_proj(hidden.reshape(*x.shape[:-1], self.intermediate_size))
+
+
+class W8A8Qwen2UpGateConcatMLP(nn.Module):
+    """Qwen2 MLP wrapper using one activation quantization and one concat gate/up GEMM."""
+
+    def __init__(self, mlp: nn.Module):
+        super().__init__()
+        if sgl_int8_scaled_mm is None:
+            raise ImportError("w8a8_int8 requires sgl_kernel.int8_scaled_mm") from _SGL_KERNEL_IMPORT_ERROR
+        self.hidden_size = mlp.hidden_size
+        self.intermediate_size = mlp.intermediate_size
+        self.act_fn = mlp.act_fn
+        self.down_proj = mlp.down_proj
+
+        gate_qweight, gate_weight_scale = _quantize_weight_per_output_channel_int8(mlp.gate_proj.weight)
+        up_qweight, up_weight_scale = _quantize_weight_per_output_channel_int8(mlp.up_proj.weight)
+        self.register_buffer("gate_up_qweight", torch.cat([gate_qweight, up_qweight], dim=0).contiguous())
+        self.register_buffer(
+            "gate_up_weight_scale",
+            torch.cat([gate_weight_scale.flatten(), up_weight_scale.flatten()], dim=0).contiguous(),
+        )
+
+        if mlp.gate_proj.bias is None and mlp.up_proj.bias is None:
+            self.gate_up_bias = None
+        else:
+            gate_bias = (
+                torch.zeros(self.intermediate_size, dtype=mlp.gate_proj.weight.dtype, device=mlp.gate_proj.weight.device)
+                if mlp.gate_proj.bias is None
+                else mlp.gate_proj.bias.detach()
+            )
+            up_bias = (
+                torch.zeros(self.intermediate_size, dtype=mlp.up_proj.weight.dtype, device=mlp.up_proj.weight.device)
+                if mlp.up_proj.bias is None
+                else mlp.up_proj.bias.detach()
+            )
+            self.gate_up_bias = nn.Parameter(torch.cat([gate_bias, up_bias], dim=0).clone(), requires_grad=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output_dtype = x.dtype
+        x_2d = x.reshape(-1, self.hidden_size).contiguous()
+        x_q, x_scale = _quantize_activation_per_token_int8(x_2d)
+        return self.forward_quantized(x_q, x_scale, x.shape[:-1], output_dtype)
+
+    def forward_quantized(
+        self,
+        x_q: torch.Tensor,
+        x_scale: torch.Tensor,
+        input_shape: Tuple[int, ...],
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        gate_up = sgl_int8_scaled_mm(
+            x_q,
+            self.gate_up_qweight.t(),
+            x_scale.flatten().contiguous(),
+            self.gate_up_weight_scale
+            if self.gate_up_weight_scale.dtype == torch.float32
+            else self.gate_up_weight_scale.float(),
+            output_dtype,
+            self.gate_up_bias,
+        )
+        gate, up = gate_up.split(self.intermediate_size, dim=-1)
+        hidden = self.act_fn(gate) * up
+        return self.down_proj(hidden.reshape(*input_shape, self.intermediate_size))
+
+
+class W8A8Qwen2QKVAttention(nn.Module):
+    """Qwen2 attention wrapper with shared activation quantization for q/k/v projections."""
+
+    def __init__(self, attention: nn.Module):
+        super().__init__()
+        if sgl_int8_scaled_mm is None:
+            raise ImportError("w8a8_int8 requires sgl_kernel.int8_scaled_mm") from _SGL_KERNEL_IMPORT_ERROR
+        if ALL_ATTENTION_FUNCTIONS is None or apply_rotary_pos_emb is None or eager_attention_forward is None:
+            raise ImportError("w8a8_int8_qkv requires transformers Qwen2 attention helpers")
+
+        self.config = attention.config
+        self.layer_idx = attention.layer_idx
+        self.head_dim = attention.head_dim
+        self.num_key_value_groups = attention.num_key_value_groups
+        self.scaling = attention.scaling
+        self.attention_dropout = attention.attention_dropout
+        self.is_causal = attention.is_causal
+        self.o_proj = attention.o_proj
+
+        self.hidden_size = attention.q_proj.in_features
+        self.q_out_features = attention.q_proj.out_features
+        self.k_out_features = attention.k_proj.out_features
+        self.v_out_features = attention.v_proj.out_features
+        q_qweight, q_weight_scale = _quantize_weight_per_output_channel_int8(attention.q_proj.weight)
+        k_qweight, k_weight_scale = _quantize_weight_per_output_channel_int8(attention.k_proj.weight)
+        v_qweight, v_weight_scale = _quantize_weight_per_output_channel_int8(attention.v_proj.weight)
+        self.register_buffer("qkv_qweight", torch.cat([q_qweight, k_qweight, v_qweight], dim=0).contiguous())
+        self.register_buffer(
+            "qkv_weight_scale",
+            torch.cat(
+                [q_weight_scale.flatten(), k_weight_scale.flatten(), v_weight_scale.flatten()],
+                dim=0,
+            ).contiguous(),
+        )
+
+        if attention.q_proj.bias is None and attention.k_proj.bias is None and attention.v_proj.bias is None:
+            self.qkv_bias = None
+        else:
+            q_bias = self._bias_or_zeros(attention.q_proj)
+            k_bias = self._bias_or_zeros(attention.k_proj)
+            v_bias = self._bias_or_zeros(attention.v_proj)
+            self.qkv_bias = nn.Parameter(torch.cat([q_bias, k_bias, v_bias], dim=0).clone(), requires_grad=False)
+
+    @staticmethod
+    def _bias_or_zeros(linear: nn.Linear) -> torch.Tensor:
+        if linear.bias is not None:
+            return linear.bias.detach()
+        return torch.zeros(linear.out_features, dtype=linear.weight.dtype, device=linear.weight.device)
+
+    def forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        attention_mask,
+        past_key_value=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        input_shape = hidden_states.shape[:-1]
+        output_dtype = hidden_states.dtype
+        hidden_states_2d = hidden_states.reshape(-1, self.hidden_size).contiguous()
+        x_q, x_scale = _quantize_activation_per_token_int8(hidden_states_2d)
+        return self.forward_quantized(
+            x_q=x_q,
+            x_scale=x_scale,
+            input_shape=input_shape,
+            output_dtype=output_dtype,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+    def forward_quantized(
+        self,
+        x_q,
+        x_scale,
+        input_shape,
+        output_dtype,
+        position_embeddings,
+        attention_mask,
+        past_key_value=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        qkv = sgl_int8_scaled_mm(
+            x_q,
+            self.qkv_qweight.t(),
+            x_scale.flatten().contiguous(),
+            self.qkv_weight_scale if self.qkv_weight_scale.dtype == torch.float32 else self.qkv_weight_scale.float(),
+            output_dtype,
+            self.qkv_bias,
+        ).reshape(*input_shape, -1)
+
+        query_states, key_states, value_states = qkv.split(
+            [self.q_out_features, self.k_out_features, self.v_out_features],
+            dim=-1,
+        )
+        query_states = query_states.view(hidden_shape).transpose(1, 2)
+        key_states = key_states.view(hidden_shape).transpose(1, 2)
+        value_states = value_states.view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        sliding_window = None
+        if (
+            self.config.use_sliding_window
+            and getattr(self.config, "sliding_window", None) is not None
+            and self.layer_idx >= self.config.max_window_layers
+        ):
+            sliding_window = self.config.sliding_window
+
+        attention_interface = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
+                qwen2_logger.warning_once(
+                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. "
+                    "Falling back to eager attention."
+                )
+            else:
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=sliding_window,
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
+class W8A8Qwen2DecoderLayerRMSQuant(nn.Module):
+    """Qwen2 decoder layer that fuses RMSNorm producer with W8A8 activation quantization."""
+
+    def __init__(self, layer: nn.Module, static_act_scale: float | None = None):
+        super().__init__()
+        self.hidden_size = layer.hidden_size
+        self.self_attn = W8A8Qwen2QKVAttention(layer.self_attn)
+        self.mlp = W8A8Qwen2UpGateConcatMLP(layer.mlp)
+        self.input_layernorm = layer.input_layernorm
+        self.post_attention_layernorm = layer.post_attention_layernorm
+        self.static_act_scale = static_act_scale
+
+    @staticmethod
+    def _rms_eps(norm: nn.Module) -> float:
+        if hasattr(norm, "variance_epsilon"):
+            return float(norm.variance_epsilon)
+        if hasattr(norm, "eps"):
+            return float(norm.eps)
+        return 1e-6
+
+    def _rmsnorm_quantize(self, hidden_states: torch.Tensor, norm: nn.Module) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden_2d = hidden_states.reshape(-1, self.hidden_size).contiguous()
+        if self.static_act_scale is not None:
+            return fused_rmsnorm_static_quantize_activation_int8(
+                hidden_2d,
+                norm.weight,
+                rms_eps=self._rms_eps(norm),
+                static_scale=self.static_act_scale,
+            )
+        return fused_rmsnorm_quantize_activation_per_token_int8(
+            hidden_2d,
+            norm.weight,
+            rms_eps=self._rms_eps(norm),
+            quant_eps=1e-6,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position=None,
+        position_embeddings=None,
+        **kwargs,
+    ):
+        residual = hidden_states
+        input_shape = hidden_states.shape[:-1]
+        x_q, x_scale = self._rmsnorm_quantize(hidden_states, self.input_layernorm)
+        hidden_states, self_attn_weights = self.self_attn.forward_quantized(
+            x_q=x_q,
+            x_scale=x_scale,
+            input_shape=input_shape,
+            output_dtype=hidden_states.dtype,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+            cache_position=cache_position,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        x_q, x_scale = self._rmsnorm_quantize(hidden_states, self.post_attention_layernorm)
+        hidden_states = self.mlp.forward_quantized(
+            x_q=x_q,
+            x_scale=x_scale,
+            input_shape=input_shape,
+            output_dtype=hidden_states.dtype,
+        )
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
+        return outputs
 
 
 W8A8FakeQuantLinear = FakeQuantLinear
@@ -361,6 +669,118 @@ def apply_llm_w8a8_int8_up_gate_quant(
 
     convert(module)
     return QuantizationSummary(mode="w8a8_int8_up_gate", replaced_linears=replaced_linears, replaced_convs=0)
+
+
+def apply_llm_w8a8_int8_up_gate_concat_quant(
+    module: nn.Module,
+    skip_name_suffixes: Tuple[str, ...] = ("lm_head",),
+) -> QuantizationSummary:
+    replaced_linears = 0
+
+    def is_qwen2_mlp(child: nn.Module) -> bool:
+        return all(hasattr(child, attr) for attr in ("gate_proj", "up_proj", "down_proj", "act_fn")) and isinstance(
+            child.gate_proj, nn.Linear
+        ) and isinstance(child.up_proj, nn.Linear)
+
+    def convert(parent: nn.Module, prefix: str = "") -> None:
+        nonlocal replaced_linears
+        for name, child in list(parent.named_children()):
+            child_prefix = f"{prefix}.{name}" if prefix else name
+            if any(child_prefix.endswith(suffix) for suffix in skip_name_suffixes):
+                continue
+            if is_qwen2_mlp(child):
+                setattr(parent, name, W8A8Qwen2UpGateConcatMLP(child))
+                replaced_linears += 2
+            else:
+                convert(child, child_prefix)
+
+    convert(module)
+    return QuantizationSummary(mode="w8a8_int8_up_gate_concat", replaced_linears=replaced_linears, replaced_convs=0)
+
+
+def apply_llm_w8a8_int8_up_gate_concat_qkv_quant(
+    module: nn.Module,
+    skip_name_suffixes: Tuple[str, ...] = ("lm_head",),
+) -> QuantizationSummary:
+    replaced_linears = 0
+
+    def is_qwen2_mlp(child: nn.Module) -> bool:
+        return all(hasattr(child, attr) for attr in ("gate_proj", "up_proj", "down_proj", "act_fn")) and isinstance(
+            child.gate_proj, nn.Linear
+        ) and isinstance(child.up_proj, nn.Linear)
+
+    def is_qwen2_attention(child: nn.Module) -> bool:
+        return all(
+            hasattr(child, attr)
+            for attr in (
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "head_dim",
+                "config",
+                "layer_idx",
+            )
+        ) and isinstance(child.q_proj, nn.Linear) and isinstance(child.k_proj, nn.Linear) and isinstance(
+            child.v_proj, nn.Linear
+        )
+
+    def convert(parent: nn.Module, prefix: str = "") -> None:
+        nonlocal replaced_linears
+        for name, child in list(parent.named_children()):
+            child_prefix = f"{prefix}.{name}" if prefix else name
+            if any(child_prefix.endswith(suffix) for suffix in skip_name_suffixes):
+                continue
+            if is_qwen2_mlp(child):
+                setattr(parent, name, W8A8Qwen2UpGateConcatMLP(child))
+                replaced_linears += 2
+            elif is_qwen2_attention(child):
+                setattr(parent, name, W8A8Qwen2QKVAttention(child))
+                replaced_linears += 3
+            else:
+                convert(child, child_prefix)
+
+    convert(module)
+    return QuantizationSummary(mode="w8a8_int8_up_gate_concat_qkv", replaced_linears=replaced_linears, replaced_convs=0)
+
+
+def apply_llm_w8a8_int8_rmsnorm_up_gate_qkv_quant(
+    module: nn.Module,
+    skip_name_suffixes: Tuple[str, ...] = ("lm_head",),
+    static_act_scale: float | None = None,
+) -> QuantizationSummary:
+    replaced_linears = 0
+
+    def is_qwen2_decoder_layer(child: nn.Module) -> bool:
+        return all(
+            hasattr(child, attr)
+            for attr in (
+                "self_attn",
+                "mlp",
+                "input_layernorm",
+                "post_attention_layernorm",
+                "hidden_size",
+            )
+        )
+
+    def convert(parent: nn.Module, prefix: str = "") -> None:
+        nonlocal replaced_linears
+        for name, child in list(parent.named_children()):
+            child_prefix = f"{prefix}.{name}" if prefix else name
+            if any(child_prefix.endswith(suffix) for suffix in skip_name_suffixes):
+                continue
+            if is_qwen2_decoder_layer(child):
+                setattr(parent, name, W8A8Qwen2DecoderLayerRMSQuant(child, static_act_scale=static_act_scale))
+                replaced_linears += 5
+            else:
+                convert(child, child_prefix)
+
+    convert(module)
+    return QuantizationSummary(
+        mode="w8a8_int8_rmsnorm_static_up_gate_qkv" if static_act_scale is not None else "w8a8_int8_rmsnorm_up_gate_qkv",
+        replaced_linears=replaced_linears,
+        replaced_convs=0,
+    )
 
 
 def apply_llm_w8a8_int8_up_gate_linear_quant(

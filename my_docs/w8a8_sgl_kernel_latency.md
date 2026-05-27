@@ -348,3 +348,207 @@ Y = X_smooth W_smooth
 3. static activation scale / SmoothQuant：用于验证能否从根本上减少动态 quantization 成本。
 
 不建议优先做的是通用 dynamic activation quant + GEMM 单 kernel 深度融合。开源生态中成熟可直接复用的实现较少，而且最终部署目标是 910B，CUDA-only 的深度融合维护成本和迁移成本都偏高。
+
+## 共享 Activation Quantization 与 Producer+Quant 初步实验
+
+本轮实验基于以下配置：
+
+```text
+2B + uniform pruning 0.50 + DDIM3 + image_max_num=6 / 3 tiles
++ pil_parallel_no_resize + addcmul_pointwise + fast DDIM + compact_v1
+```
+
+测试均在 GPU2 上使用 CUDA event，`num_samples=50`，`warmup=5`。
+
+### Gate/Up Concat GEMM
+
+在已有 `W8A8Qwen2UpGateMLP` 的基础上新增 `w8a8_int8_up_gate_concat` 模式。旧实现已经共享一次 activation quantization，但仍分别执行两次 GEMM：
+
+```text
+x_q, x_scale = quant(x)
+gate = int8_scaled_mm(x_q, gate_weight)
+up   = int8_scaled_mm(x_q, up_weight)
+```
+
+新实现将 `gate_proj` 和 `up_proj` 的 int8 weight / scale 在输出维度 concat，改成一次 GEMM 后再 split：
+
+```text
+x_q, x_scale = quant(x)
+gate_up = int8_scaled_mm(x_q, cat([gate_weight, up_weight]))
+gate, up = split(gate_up)
+```
+
+数值等价性：dummy MLP smoke test 中，旧 shared-quant 与 concat GEMM 输出最大绝对误差为 `0.0`。
+
+纯 GEMM microbenchmark，shape 为 `M=580,K=1536,N_each=8960`：
+
+| 配置 | Latency |
+|---|---:|
+| separate gate/up GEMM only | 0.1179 ms |
+| concat gate/up GEMM only | 0.1038 ms |
+| separate gate/up + shared quant | 0.1306 ms |
+| concat gate/up + shared quant | 0.1120 ms |
+
+microbenchmark 显示每层 gate/up concat 大约节省 `0.0186 ms`。但端到端 LLM 统计中收益明显被整体 forward 噪声和其它模块开销稀释。
+
+### QKV Shared Quant / Concat GEMM
+
+新增 `w8a8_int8_up_gate_concat_qkv` 模式。在 `gate/up concat` 基础上，额外将 Qwen2 attention 的 `q_proj / k_proj / v_proj` 替换为 QKV wrapper：
+
+```text
+x_q, x_scale = quant(hidden_states)
+qkv = int8_scaled_mm(x_q, cat([q_weight, k_weight, v_weight]))
+q, k, v = split(qkv)
+```
+
+`o_proj` 保持 BF16，因为此前 microbenchmark 显示 attention/o projection 的 W8A8 total 收益较小，直接量化风险更高。
+
+### End-to-End Latency
+
+结果文件：
+
+```text
+/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/bf16_gpu2_rerun_2b_uniform050_ddim3_maxnum6_pil_parallel_no_resize_fastddim_compact_v1_50.json
+/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/w8a8_int8_llm_up_gate_shared_quant_gpu2_rerun_2b_uniform050_ddim3_maxnum6_pil_parallel_no_resize_fastddim_compact_v1_50.json
+/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/w8a8_int8_llm_up_gate_concat_2b_uniform050_ddim3_maxnum6_pil_parallel_no_resize_fastddim_compact_v1_50.json
+/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/w8a8_int8_llm_up_gate_concat_qkv_2b_uniform050_ddim3_maxnum6_pil_parallel_no_resize_fastddim_compact_v1_50.json
+```
+
+| 配置 | E2E mean | VLM mean | LLM mean | Vision mean | Diffusion mean |
+|---|---:|---:|---:|---:|---:|
+| BF16 GPU2 rerun | 88.429 ms | 49.283 ms | 25.548 ms | 17.086 ms | 38.083 ms |
+| Up/Gate shared-quant W8A8 | 87.391 ms | 49.268 ms | 25.589 ms | 17.078 ms | 37.077 ms |
+| Up/Gate concat W8A8 | 87.612 ms | 49.288 ms | 25.502 ms | 17.097 ms | 37.077 ms |
+| Up/Gate concat + QKV W8A8 | 84.598 ms | 48.175 ms | 24.450 ms | 17.002 ms | 35.991 ms |
+
+对比 BF16 GPU2 rerun：
+
+- `Up/Gate shared-quant` 对 VLM/LLM 基本没有稳定收益，E2E 降低主要来自 diffusion 测量波动。
+- `Up/Gate concat` 只让 LLM mean 降低约 `0.046 ms`，端到端收益不稳定；说明单独减少 gate/up 的一个 GEMM launch 不足以明显改变整体 VLM latency。
+- `Up/Gate concat + QKV` 让 VLM mean 降低 `1.107 ms`，LLM mean 降低 `1.098 ms`，这是目前 W8A8 选择性量化中更有意义的收益。
+- Diffusion latency 在这些实验中也有波动，但 QKV 量化并不改变 diffusion 模块结构，因此判断 VLM 优化时应优先看 `VLM mean` 和 `LLM mean`。
+
+### RMSNorm + Quant Microbenchmark
+
+新增 `scripts/evaluation/benchmark_rmsnorm_quant_cuda_event.py`，用于评估 producer + quant fusion 的理论收益。该实验只做 microbenchmark，尚未接入端到端模型。
+
+结果文件：
+
+```text
+/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/rmsnorm_quant_fusion_microbench_gpu2.json
+```
+
+| Shape | RMSNorm only | RMSNorm then quant | Fused RMSNorm+quant | q max diff | scale max diff |
+|---|---:|---:|---:|---:|---:|
+| LLM hidden `580x1536` | 0.0758 ms | 0.0871 ms | 0.0103 ms | 2 | 2.07e-4 |
+| Vision hidden `2304x1024` | 0.0872 ms | 0.1000 ms | 0.0195 ms | 1 | 2.41e-4 |
+| Diffusion hidden `64x1024` | 0.0752 ms | 0.0865 ms | 0.0101 ms | 1 | 1.46e-4 |
+
+结论：
+
+- 单独看 kernel，`RMSNorm + activation quant` 融合有明显潜力，可以把一次 producer + quant 从约 `0.087-0.100 ms` 降到 `0.010-0.019 ms`。
+- 当前 fused kernel 的数值路径与 PyTorch RMSNorm 后再 quant 不完全一致，int8 输出最大差异为 `1-2`，scale 最大差异约 `1e-4`。该误差不大，但接入端到端前仍需要做 PDMS 验证。
+- 下一步如果继续做 producer+quant fusion，建议先接入 LLM RMSNorm 后进入 QKV / MLP 的位置，并保留开关，避免和 QKV 量化本身的精度影响混在一起。
+
+### 为什么 Dynamic Quant 的 Amax Reduction 开销明显
+
+W8A8 dynamic activation quantization 的核心代价不只是 `round + cast int8`，而是每个 token 都要沿 hidden 维度做一次全量 `amax` reduction：
+
+```text
+scale[i] = max(abs(x[i, :])) / 127
+```
+
+以 LLM hidden `M=580,K=1536` 为例，per-token quantization 至少要完成以下步骤：
+
+1. 读取每个 token 的完整 hidden 向量。
+2. 对所有元素做 `abs`。
+3. 在线程块内做 max reduction，并同步得到该 token 的 scale。
+4. 再遍历一次输入，用 `x / scale` 做 `round + clamp + cast int8`。
+5. 写出完整 int8 activation 和 per-token scale。
+
+这类操作贵的原因：
+
+- 它必须扫描完整输入，否则 scale 不准，容易发生 int8 饱和。
+- reduction 有线程同步和规约开销，不像逐元素乘加那样完全并行。
+- 即使融合成单个 kernel，也通常需要两阶段处理：先得到 scale，再量化，因此很难避免至少一次完整读输入和一次写 int8。
+- 它主要是 memory/reduction bound，Tensor Core 基本帮不上忙。
+- 开销近似随 `M*K` 增长，因此 `down_proj` 这类大 `K` 输入特别不划算。
+
+这解释了为什么某些 Linear 单看 int8 GEMM 有收益，但加上 dynamic quant 后收益被吃掉：
+
+```text
+W8A8 total = dynamic activation quant + int8_scaled_mm + scale epilogue
+BF16 total = highly optimized BF16 GEMM
+```
+
+当 `dynamic activation quant` 接近或超过 `BF16 GEMM - int8 GEMM` 的差值时，W8A8 total 就不会比 BF16 快。后续优化 dynamic quant 的重点应放在减少 reduction 次数、复用 quant 结果、或者用 static scale / SmoothQuant 去掉在线 amax，而不是单纯继续优化 `round/cast`。
+
+### RMSNorm+Quant 接入端到端
+
+新增 `w8a8_int8_rmsnorm_up_gate_qkv` 模式，把 Qwen2 decoder layer 中两处 RMSNorm producer 直接和 activation quantization 融合：
+
+```text
+input_layernorm(hidden_states) -> quant -> QKV int8 GEMM
+post_attention_layernorm(hidden_states) -> quant -> gate/up int8 GEMM
+```
+
+该实现通过 decoder layer wrapper 保持原始 residual、attention、MLP 调用结构不变，只改变进入 QKV 和 gate/up int8 GEMM 前的 RMSNorm+Quant 路径。由于 RMSNorm+Quant fused kernel 的数值路径与 PyTorch RMSNorm 后再 quant 有微小差异，PDMS 需要单独验证。
+
+Latency 结果文件：
+
+```text
+/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/w8a8_int8_rmsnorm_up_gate_qkv_gpu6_rerun_2b_uniform050_ddim3_maxnum6_pil_parallel_no_resize_fastddim_compact_v1_50.json
+```
+
+同配置对比：
+
+| 配置 | E2E mean | VLM mean | LLM mean | Vision mean | Diffusion mean |
+|---|---:|---:|---:|---:|---:|
+| BF16 GPU2 rerun | 88.429 ms | 49.283 ms | 25.548 ms | 17.086 ms | 38.083 ms |
+| Up/Gate concat + QKV W8A8 | 84.598 ms | 48.175 ms | 24.450 ms | 17.002 ms | 35.991 ms |
+| RMSNorm+Quant + Up/Gate concat + QKV W8A8 | 78.295 ms | 40.763 ms | 17.417 ms | 16.947 ms | 37.029 ms |
+
+结论：
+
+- RMSNorm+Quant 接入端到端后，LLM mean 从 `24.450 ms` 降到 `17.417 ms`，比 QKV/shared-quant 版本进一步降低约 `7.0 ms`。
+- 相比 BF16，LLM mean 降低约 `8.1 ms`，VLM mean 降低约 `8.5 ms`。
+- 这说明此前 dynamic quant 的主要开销并不只是 int8 cast，而是 RMSNorm producer 写回、activation 重新读取、per-token amax reduction 与 quant kernel launch 的组合开销。
+- 当前最重要的风险是精度。PDMS 已启动重新验证，实验名为 `recogdrive_agent_eval_2b_uniform050_ddim3_maxnum6_pil_compact_v1_fastddim_w8a8_rmsnorm_qkv_fixed_zxz`。
+
+### Static Activation Scale 初步测试
+
+新增 `w8a8_int8_rmsnorm_static_up_gate_qkv` 模式，用固定 activation scale 替代 per-token dynamic scale。当前只是初步验证去掉在线 `amax` 的 latency 上限，默认：
+
+```text
+RECOGDRIVE_RMSNORM_STATIC_ACT_SCALE=0.03
+```
+
+结果文件：
+
+```text
+/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/w8a8_int8_rmsnorm_static003_up_gate_qkv_2b_uniform050_ddim3_maxnum6_pil_parallel_no_resize_fastddim_compact_v1_50.json
+```
+
+同 GPU6 对比：
+
+| 配置 | E2E mean | VLM mean | LLM mean | Vision mean | Diffusion mean |
+|---|---:|---:|---:|---:|---:|
+| RMSNorm+dynamic quant | 78.295 ms | 40.763 ms | 17.417 ms | 16.947 ms | 37.029 ms |
+| RMSNorm+static scale 0.03 | 80.153 ms | 41.264 ms | 17.599 ms | 16.973 ms | 37.736 ms |
+
+结论：
+
+- 当前 naive static scale 没有带来 latency 收益，VLM mean 反而慢约 `0.50 ms`，LLM mean 慢约 `0.18 ms`。
+- 原因是 static scale 只去掉了 quant 阶段的 `amax`，但 RMSNorm 本身仍然需要对 hidden 维度做平方和 reduction；因此整体 producer+quant 路径仍然是 reduction-bound。
+- 当前实现还需要给 SGL `int8_scaled_mm` 提供 activation scale tensor，即使 scale 是常数，也仍然要写出 per-token scale buffer。
+- 未做 calibration 的 static scale 精度风险较大，因此暂时不跑 PDMS。后续若继续探索 static scale，应先做 calibration / SmoothQuant，而不是手工设一个全局常数 scale。
+
+补充 kernel microbenchmark：
+
+| Shape | RMSNorm+dynamic quant | RMSNorm+static scale 0.03 |
+|---|---:|---:|
+| LLM hidden `580x1536` | 0.0103 ms | 0.0104 ms |
+| Vision hidden `2304x1024` | 0.0194 ms | 0.0131 ms |
+| Diffusion hidden `64x1024` | 0.0100 ms | 0.0101 ms |
+
+LLM 形状下 static scale kernel 与 dynamic fused kernel 基本持平，因此端到端没有进一步收益是符合预期的。static scale 更可能带来收益的前提是进一步减少 scale tensor 写回、或者让后续 GEMM kernel 原生支持 scalar/per-layer scale，而不是仍然走 per-token scale tensor 接口。
