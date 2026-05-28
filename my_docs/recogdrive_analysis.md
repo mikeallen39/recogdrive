@@ -182,6 +182,56 @@ FlashAttention2 复测环境：
 
 针对 `2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM`，测试了 `compact_v1` prompt。该版本只压缩 system message 和输出要求，不改历史轨迹格式、不改 high-level command 表达，因此属于低风险 prompt 压缩。
 
+### Prompt 文本对比
+
+原始 `full` system prompt：
+
+```text
+You are a vehicle trajectory prediction model for autonomous driving. Your task is to predict the ego vehicle's 4-second trajectory based on the following inputs: multi-view images from 8 cameras, ego vehicle states (position), and discrete navigation commands. The input provides a 2-second history, and your output should ensure a safe trajectory for the next 4 seconds. Your predictions must adhere to the following metrics:
+1. **No at-fault Collisions (NC)**: Avoid collisions with other objects/vehicles.
+2. **Drivable Area Compliance (DAC)**: Stay within the drivable area.
+3. **Time to Collision (TTC)**: Maintain a safe distance from other vehicles.
+4. **Ego Progress (EP)**: Ensure the ego vehicle moves forward without being stuck.
+5. **Comfort (C)**: Avoid sharp turns and sudden decelerations.
+6. **Driving Direction Compliance (DDC)**: Align with the intended driving direction.
+For evaluation, use the **PDM Score**, which combines these metrics: **PDM Score** = NC * DAC * (5*TTC + 5*EP + 2*C + 0*DDC) / 12.
+Your predictions will be evaluated through a non-reactive 4-second simulation with an LQR controller and background actors following their recorded trajectories. The better your predictions, the higher your score.
+```
+
+压缩后 `compact_v1` system prompt：
+
+```text
+You are an autonomous driving trajectory predictor. Given the front-view image, ego motion history, and navigation command, predict a safe 4-second ego trajectory.
+```
+
+原始 `full` user prompt 模板：
+
+```text
+<image>
+As an autonomous driving system, predict the vehicle's trajectory based on:
+1. Visual perception from front camera view
+2. Historical motion context (last 4 timesteps):   - t-3: ({x0}, {y0}, {heading0})    - t-2: ({x1}, {y1}, {heading1})    - t-1: ({x2}, {y2}, {heading2})    - t-0: ({x3}, {y3}, {heading3})
+3. Active navigation command: [{COMMAND}]
+Output requirements:
+- Predict 8 future trajectory points
+- Each point format: (x:float, y:float, heading:float)
+- Use [PT, ...] to encapsulate the trajectory
+- Maintain numerical precision to 2 decimal places
+```
+
+压缩后 `compact_v1` user prompt 模板：
+
+```text
+<image>
+As an autonomous driving system, predict the vehicle's trajectory based on:
+1. Visual perception from front camera view
+2. Historical motion context (last 4 timesteps):   - t-3: ({x0}, {y0}, {heading0})    - t-2: ({x1}, {y1}, {heading1})    - t-1: ({x2}, {y2}, {heading2})    - t-0: ({x3}, {y3}, {heading3})
+3. Active navigation command: [{COMMAND}]
+Output 8 future poses as [PT, (x,y,heading), ...].
+```
+
+其中 `{COMMAND}` 为 `TURN LEFT / GO STRAIGHT / TURN RIGHT` 之一，历史轨迹数值由 `format_number(..., decimal_places=2)` 生成。实际进入 tokenizer 前还会经过 InternVL conversation template 包装，但语义压缩只发生在上面的 system message 和输出要求部分。
+
 结果文件：
 
 - full prompt latency：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/fusion_fastddim_2b_uniform050_ddim3_maxnum6_pil_parallel_no_resize_50.json`
