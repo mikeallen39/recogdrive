@@ -123,15 +123,21 @@ FlashAttention2 复测环境：
 
 关键观测：
 
-- 原始 PIL 路径下，单次请求图片预处理约 `55.319 ms`；更早未限制 `max_num` 的 baseline 中图片预处理为 `75-95 ms` 量级。
+- 默认 tile 数更多的配置中，PIL 图片预处理约 `75 ms`：例如 `2B uniform pruning 0.50` 为 `75.000 ms`，`2B uniform pruning 0.50 + DDIM3` 为 `75.142 ms`，平均 `9 tiles`。
+- 将 `image_max_num` 限制到 `6` 后，navtest 常见样本变为 `3 tiles`，但 CPU wall time 对运行时状态比较敏感。早期同配置结果中图片预处理为 `55.319 ms`，2026-05-28 在空闲 GPU3 上复测同配置得到 mean `81.467 ms`、median `79.451 ms`、trimmed mean `80.346 ms`。
+- 后续单独做 PIL backend ablation 时，`pil` 行测得 `79.704 ms`，这是另一批实验文件，叠加了 `addcmul_pointwise` 配置和不同运行时 CPU 抖动；因此不应把它与 `55.319 ms` 混为同一 baseline。
 - `dynamic_preprocess` 中有两次主要 resize：原图缩放到动态 tile 大小，以及生成 `448x448` thumbnail；其中 resize 是 CPU 侧最大瓶颈。
 - `Image.open` 本身只是懒加载，真正 JPEG decode 通常在后续 `convert("RGB")` 或 resize 时触发，因此 `open / decode+convert / resize` 三者在 PIL 路径里会互相耦合。
 
-PIL baseline 结果：
+`image_max_num=6 / 3 tiles` PIL 结果：
 
-| 配置 | 图片预处理 CPU(ms) | VLM(ms) | diffusion(ms) | e2e GPU(ms) | 完整 latency(ms) |
-|---|---:|---:|---:|---:|---:|
-| PIL backend | 55.319 | 55.578 | 54.275 | 111.935 | 167.491 |
+| 结果 | 图片预处理 CPU mean(ms) | 图片预处理 CPU median(ms) | VLM(ms) | diffusion(ms) | e2e GPU(ms) | 完整 latency mean(ms) |
+|---|---:|---:|---:|---:|---:|---:|
+| 结果 | 55.319 | - | 55.578 | 54.275 | 111.935 | 167.491 |
+
+复测结果文件：
+
+- `/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_uniform050_ddim3_maxnum6_pil_rerun_20260528_50.json`
 
 结论：
 
@@ -162,7 +168,6 @@ PIL baseline 结果：
 
 | backend | 图片预处理 CPU mean(ms) | e2e GPU mean(ms) | 完整 latency mean(ms) | 与原 PIL tensor 等价 |
 |---|---:|---:|---:|---|
-| pil | 79.704 | 96.547 | 176.441 | - |
 | pil_no_resize | 52.412 | 95.710 | 148.319 | 是 |
 | pil_parallel | 41.220 | 96.299 | 137.708 | 是 |
 | pil_parallel_no_resize | 41.395 | 94.597 | 136.188 | 是 |
@@ -533,6 +538,26 @@ block-level profiling 会显著增加同步开销，带打点时 `profiled diffu
 - `addcmul_residual`：只把 gated residual 改成 `torch.addcmul(hidden, output, gate)`。
 - `addcmul_pointwise`：把 modulation 改成 `torch.addcmul(shift, x, 1 + scale)`，同时 residual 使用 `torch.addcmul`。
 
+具体改动位置：
+
+- `LightningDiTBlock` 的两处 AdaLN modulation：attention 前的 `norm1 -> modulate` 和 FFN 前的 `norm2 -> modulate`。
+- `LightningDiTBlock` 的两处 gated residual：attention 输出回加和 FFN 输出回加。
+- `FinalLayer` 的 final AdaLN modulation：`norm_final -> modulate -> linear`。
+- `fast_ddim_action` 路径中 DDIM update 的若干小公式也使用 `addcmul` 表达式，但这部分收益明显小于 DiT block 内的 modulation/residual 改写。
+
+为什么可能更快：
+
+- 原始 `x * (1 + scale) + shift` 至少包含 `scale + 1`、`x * scale`、`+ shift` 三类逐元素操作，中间张量和 kernel launch 更容易累积。
+- `torch.addcmul(input, tensor1, tensor2)` 表达的是 `input + tensor1 * tensor2`，PyTorch/CUDA 后端可以把乘加以单个 fused multiply-add 风格的 pointwise kernel 表达出来，减少中间 tensor 读写。
+- 当前 DiT 每个 forward 有 `16` 个 block，DDIM3 会重复 `48` 次 block；单个 pointwise 很小，但 `modulate/residual` 在每个 block 里反复出现，累计 kernel launch 和显存带宽开销明显。
+- 这个优化不触碰 Linear/Attention/FFN 权重，也不改变 token、hidden shape 或 DDIM step，因此属于低风险算子表达式重排。
+
+为什么 `addcmul_residual` 单独收益很小：
+
+- residual 的形状只有 action query 长度 `8` 对应的小张量，单独优化 `hidden + gate * output` 的绝对开销有限。
+- `addcmul_pointwise` 的主要收益来自 AdaLN modulation 路径，因为它出现在 attention、FFN、final layer 前，并且和 norm/attention/FFN 之间形成大量小 pointwise kernel。
+- 因此后续如果继续做融合，优先方向不是只改 residual，而是把 `RMSNorm + AdaLN modulation + residual` 作为连续 pattern 做静态图或自定义融合。
+
 结果文件：
 
 - baseline：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/fusion_ablation_baseline_50.json`
@@ -611,6 +636,33 @@ SDPA backend ablation：
 - `math` 明显更慢，不应作为部署路径。
 - `flash` 和 `cudnn` 失败原因是 diffusion planner 当前 attention 的 Q/K/V 为 `float32`，PyTorch flash/cudnn SDPA 要求 Q/K/V 为 `float16` 或 `bfloat16`。
 - 这说明单纯切 SDPA backend 没有明显额外空间；如果要继续挖 attention，需要考虑把 action head 的 attention 子路径安全降到 fp16/bf16 或针对 910B 做静态图融合，而不是强制 PyTorch backend。
+
+### Fast DDIM 机制说明
+
+`fast_ddim_action` 不是减少 DDIM step，也不是改变采样公式；它是对 `get_action()` 的推理路径做等价重排，目标是在固定 `DDIM3/5` 步数下减少每一步重复计算和小算子开销。
+
+原始 `get_action()` 每个 denoise step 都会重新执行完整 DiT forward。DiT block 中既有 self-attention，也有 cross-attention。cross-attention 的 `encoder_hidden_states` 来自 VLM 输出的 `vl_features`，在整个 DDIM 采样循环内是不变的，因此每个 step 反复计算 cross-attention 的 `to_k / to_v / k_norm` 是冗余的。
+
+`fast_ddim_action` 当前做了几类优化：
+
+- 预先对所有 cross-attention block 调用 `build_cross_attention_kv_cache(vl_embeds)`，把由 VLM 条件特征产生的 K/V 缓存下来。
+- DiT forward 改走 `forward_with_kv_cache()`，cross-attention 中复用缓存的 K/V，只保留每一步必须重新计算的 Q、q_norm、SDPA 和 to_out。
+- 把 history embedding、VLM mean、action position embedding、eta tensor、timestep/index tensor 等 DDIM loop-invariant 或可预生成的内容移到循环外。
+- 部分 `repeat` 改成 `expand`，减少无意义的张量复制。
+- DDIM update 里的若干逐元素表达式改成 `addcmul` 写法，减少中间张量，但这部分不是主要收益来源。
+
+为什么这在数学上可以等价：
+
+- DDIM 每一步变化的是当前 action latent `x_t` 和 timestep `t`，所以 action encoder、Q projection、self-attention、AdaLN conditioning 等仍然每步重新计算。
+- VLM 条件特征 `vl_features` 在一次请求内不随 denoise step 改变，因此 cross-attention 的 K/V 只依赖 `vl_features` 和对应 Linear/Norm 权重，可以提前算好并复用。
+- 当前等价性测试中，固定同一 `init_actions` 且 `deterministic=True` 时，`get_action()` 与 `get_action_fast_ddim()` 的 `max_abs_diff=0.0`、`mean_abs_diff=0.0`；DDIM 公式单独重写的最大差异约 `9.54e-7`，属于浮点表达式重排量级。
+
+收益边界：
+
+- 它只能去掉 cross-attention K/V 相关重复计算，不能减少 self-attention、Q projection、SDPA、FFN、norm、AdaLN、residual 等每步必须执行的部分。
+- 因此 fast DDIM 是低风险 training-free 优化，但不是大幅加速方案；在当前 `2B uniform pruning 0.50 + DDIM3 + image max_num 6 / 3 tiles + pil_parallel_no_resize + addcmul_pointwise` 配置下，diffusion mean 从 `40.96 ms` 降到 `38.70 ms`，约 `2.26 ms`。
+- 显存代价是额外保存 cross-attention K/V cache；当前 2B small diffusion 下这部分远小于 VLM 显存，不是主要瓶颈。
+- 适用前提是 VLM 条件特征在 denoise loop 内不变。如果后续模型设计让条件特征随 step 更新，或者训练路径需要完整梯度行为，就不能直接复用该 cache。
 
 ### Diffusion Attention 内部拆分
 
