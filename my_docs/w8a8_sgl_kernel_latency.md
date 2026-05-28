@@ -38,7 +38,6 @@ W8A8 SGL kernel 结果文件：
 | BF16 baseline | 88.261 ms | 48.800 ms | 17.070 ms | 25.591 ms | 38.161 ms |
 | W8A8 SGL kernel | 130.174 ms | 89.001 ms | 32.227 ms | 48.319 ms | 39.961 ms |
 | W8A8 SGL kernel + fused activation quant | 91.465 ms | 52.124 ms | 16.420 ms | 29.148 ms | 38.174 ms |
-| W8A8 fused quant - BF16 | +3.204 ms | +3.324 ms | -0.650 ms | +3.557 ms | +0.013 ms |
 
 结论：
 
