@@ -48,8 +48,6 @@ FlashAttention2 复测环境：
 | 2B uniform pruning 0.50 | 0.881033 | 272.212 |
 | 2B uniform pruning 0.50 + DDIM 3 | 0.879912 | 234.602 |
 | 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles | 0.850495 | 167.491 |
-| 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + OpenCV image backend | 0.837151 | 133.029 |
-| 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + OpenCV + addcmul pointwise fusion | 同 OpenCV 行（数值等价） | 129.471 |
 | 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM | 同 PIL 行（数值等价） | 137.370 |
 | 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM + compact prompt v1 | 0.849623 | 131.476 |
 | 2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + PIL optimized + addcmul pointwise fusion + fast DDIM + compact prompt v1 + LLM W8A8 fake quant | 0.849867 | 未测 |
@@ -128,49 +126,22 @@ FlashAttention2 复测环境：
 - 原始 PIL 路径下，单次请求图片预处理约 `55.319 ms`；更早未限制 `max_num` 的 baseline 中图片预处理为 `75-95 ms` 量级。
 - `dynamic_preprocess` 中有两次主要 resize：原图缩放到动态 tile 大小，以及生成 `448x448` thumbnail；其中 resize 是 CPU 侧最大瓶颈。
 - `Image.open` 本身只是懒加载，真正 JPEG decode 通常在后续 `convert("RGB")` 或 resize 时触发，因此 `open / decode+convert / resize` 三者在 PIL 路径里会互相耦合。
-- 改成 OpenCV backend 后，`cv2.imread + cv2.cvtColor + cv2.resize + numpy-to-torch normalize` 将图片预处理降到 `23.235 ms`。
 
-对比结果：
+PIL baseline 结果：
 
 | 配置 | 图片预处理 CPU(ms) | VLM(ms) | diffusion(ms) | e2e GPU(ms) | 完整 latency(ms) |
 |---|---:|---:|---:|---:|---:|
 | PIL backend | 55.319 | 55.578 | 54.275 | 111.935 | 167.491 |
-| OpenCV backend | 23.235 | 54.779 | 53.893 | 109.591 | 133.029 |
 
 结论：
 
-- OpenCV backend 的主要收益来自 CPU 图片解码和 resize，GPU 侧 VLM / diffusion 基本不变。
-- OpenCV 后完整 latency 从 `167.491 ms` 降到 `133.029 ms`，节省约 `34.5 ms`。
-- OpenCV 后 navtest PDMS 为 `0.837151`，相比同配置 PIL backend 的 `0.850495` 下降 `0.013344`。
-- 如果不能做预缓存，后续 CPU 侧可继续考虑更高效的在线 decode/resize 后端，但单靠图片预处理已经很难补足到 `100 ms` 内的全部差距。
-
-OpenCV 精度结果：
-
-- 结果文件：`/data/zxz/HUAWEI/VLA/navsim_data/exp/recogdrive_agent_eval_2b_prune_uniform_050_ddim3_maxnum6_opencv_zxz/2026.05.23.02.15.45/2026.05.23.03.36.02.csv`
-- 成功场景：`12146/12146`
-- failed：`0`
-
-| 配置 | PDMS | NC | DAC | EP | TTC | C | DDC |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| PIL backend | 0.850495 | - | - | - | - | - | - |
-| OpenCV backend | 0.837151 | 0.951301 | 0.936605 | 0.814433 | 0.890746 | 1.000000 | 0.957393 |
-
-精度下降拆分：
-
-- 相比原始 2B baseline `0.904283`，当前 OpenCV 配置总下降 `0.067132`。
-- 其中 `uniform@0.50 + DDIM3` 本身仍有 `0.879912`，相对 baseline 只下降 `0.024371`。
-- `image max_num=6 / 3 tiles` 将 PDMS 从 `0.879912` 降到 `0.850495`，额外下降 `0.029417`，这是更主要的精度损失来源。
-- OpenCV backend 再从 `0.850495` 降到 `0.837151`，额外下降 `0.013344`。
-
-原因判断：
-
+- `image max_num=6 / 3 tiles` 将 PDMS 从 `0.879912` 降到 `0.850495`，额外下降 `0.029417`，这是主要的精度损失来源。
 - `max_num=6 / 3 tiles` 会减少动态 tiling 覆盖的视野细节；虽然仍是前视单图，但 tile 数减少会影响远处小目标、车道边界和局部几何信息，因此 PDMS 会下降。
-- OpenCV 路径与原 PIL/torchvision 路径不完全数值等价：JPEG decode、RGB 转换、resize interpolation、rounding、归一化执行顺序都可能产生像素级差异。VLM 对这类输入分布差异比较敏感，尤其当前已经叠加 `uniform@0.50` token pruning 和 `3 tiles` 压缩，鲁棒性余量更小。
-- 因此这次“掉得挺多”不是单一 OpenCV 造成的，而是 `tile 数减少` 是主要项，`OpenCV 预处理数值差异` 是次要但可见项。
+- 如果不能做预缓存，后续 CPU 侧可继续考虑更高效的在线 PIL 等价 decode/resize 路径，但单靠图片预处理已经很难补足到 `100 ms` 内的全部差距。
 
 ### PIL Backend 保精度优化
 
-为避免 OpenCV 数值路径导致 PDMS 下降，进一步测试了只优化 PIL 路径的 backend：
+进一步测试了只优化 PIL 路径的 backend：
 
 - `pil_no_resize`：保留 `Image.open().convert("RGB")`、`dynamic_preprocess()`、crop 和 thumbnail，只去掉 tile 后 `torchvision.Resize(448,448)`。
 - `pil_parallel`：保留原 transform，但并行执行 dynamic grid resize 和 thumbnail resize。
@@ -180,7 +151,7 @@ OpenCV 精度结果：
 
 - 抽取 20 张 navtest 前视图，对比原 `pil` 与 `pil_no_resize` / `pil_parallel` / `pil_parallel_no_resize` 的输出 tensor。
 - 三个 PIL 优化 backend 均为 `max_abs_diff=0.0`、`mean_abs_diff=0.0`，`num_patches` 和 shape 完全一致。
-- 因此这些 backend 理论上与原 PIL 数值等价，不需要像 OpenCV 一样额外担心 PDMS 下降。
+- 因此这些 backend 理论上与原 PIL 数值等价，属于更适合保精度部署的图片预处理优化方向。
 
 结果文件：
 
@@ -199,8 +170,8 @@ OpenCV 精度结果：
 结论：
 
 - `pil_no_resize` 证明 `torchvision.Resize(448,448)` 是冗余开销，去掉后 tensor 与原 PIL 完全一致，图片预处理下降约 `27.3 ms`。
-- `pil_parallel` / `pil_parallel_no_resize` 进一步把图片预处理降到约 `41 ms`，完整 latency 约 `136 ms`，接近 OpenCV 的 `133 ms`，但保持原 PIL tensor 完全等价。
-- 当前最推荐的保精度图片 backend 是 `pil_parallel_no_resize`；相比 OpenCV，它牺牲约 `3 ms` latency，但避免了 OpenCV 额外 `0.013344` PDMS 下降风险。
+- `pil_parallel` / `pil_parallel_no_resize` 进一步把图片预处理降到约 `41 ms`，完整 latency 约 `136 ms`，同时保持原 PIL tensor 完全等价。
+- 当前最推荐的保精度图片 backend 是 `pil_parallel_no_resize`。
 
 ## Prompt 压缩实验
 
@@ -512,12 +483,10 @@ LLM 结论：
 
 测试配置：
 
-- 模型：`2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + OpenCV image backend`
+- 模型：`2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles`
 - 功能级 profiling：`warmup=5`，有效样本 `30`
 - block-level profiling：`warmup=5`，有效样本 `10`
 - 脚本：`scripts/evaluation/profile_recogdrive_diffusion_cuda_event.py`
-- 功能级结果：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_diffusion_profile_uniform050_ddim3_maxnum6_opencv_30.json`
-- block-level 结果：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_diffusion_block_profile_uniform050_ddim3_maxnum6_opencv_10.json`
 
 功能级拆分：
 
@@ -624,12 +593,8 @@ block-level profiling 会显著增加同步开销，带打点时 `profiled diffu
 
 SDPA backend ablation：
 
-- 测试配置：`2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + OpenCV + addcmul pointwise + RoPE slice`
+- 测试配置：`2B uniform pruning 0.50 + DDIM 3 + image max_num 6 / 3 tiles + addcmul pointwise + RoPE slice`
 - 测试 GPU：A800 GPU0，`warmup=5`，有效样本 `50`
-- 结果文件：
-- auto：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/sdpa_ablation_2b_uniform050_ddim3_maxnum6_opencv_addcmul_auto_50.json`
-- math：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/sdpa_ablation_2b_uniform050_ddim3_maxnum6_opencv_addcmul_math_50.json`
-- efficient：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/sdpa_ablation_2b_uniform050_ddim3_maxnum6_opencv_addcmul_efficient_50.json`
 - flash / cudnn：运行失败，无有效 JSON。
 
 | SDPA backend | 状态 | diffusion mean(ms) | diffusion trimmed mean(ms) | e2e GPU mean(ms) | e2e GPU trimmed mean(ms) |
@@ -651,10 +616,7 @@ SDPA backend ablation：
 
 为了确认 block-level profiling 中 `attention=9.259 ms` 的组成，进一步在 `Attention.forward()` 内部用 CUDA event 拆分：
 
-- no fast-DDIM：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_diffusion_attention_internal_uniform050_ddim3_maxnum6_opencv_10.json`
-- fast-DDIM：`/data/zxz/HUAWEI/VLA/navsim_data/exp/latency/recogdrive_2b_diffusion_attention_internal_fastddim_uniform050_ddim3_maxnum6_opencv_10.json`
-
-测试配置：`2B + uniform@0.50 + DDIM3 + image max_num 6 / 3 tiles + OpenCV`。注意：attention 内部插入大量 CUDA event 会显著改变绝对耗时，因此下面主要看相对占比和调用数变化，不直接替代原始 latency。
+测试配置：`2B + uniform@0.50 + DDIM3 + image max_num 6 / 3 tiles`。注意：attention 内部插入大量 CUDA event 会显著改变绝对耗时，因此下面主要看相对占比和调用数变化，不直接替代原始 latency。
 
 no fast-DDIM 下，`attention` 是完整 attention module 调用，包含 `to_q/to_k/to_v`、`q_norm/k_norm`、RoPE、SDPA、`to_out` 和 reshape。按内部 component sum 的占比估算，映射到原 block-level `attention=9.259 ms` 后大致为：
 
